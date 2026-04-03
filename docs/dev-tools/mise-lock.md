@@ -194,7 +194,7 @@ mise use node@24
 Backend support for lockfile features varies:
 
 - ✅ **Full support** (version + checksum + size + URL): `aqua`, `http`, `github`, `gitlab`
-  - _Provenance support_: `aqua`, `github`, `core:ruby` (precompiled binaries), `core:zig` (install-time)
+  - _Provenance support_: `aqua`, `github`, `core:python` (precompiled binaries), `core:ruby` (precompiled binaries), `core:zig` (install-time)
 - ⚠️ **Partial support** (version + URL + provenance): `vfox` (tool plugins only)
 - ⚠️ **Partial support** (version + checksum + size): `ubi`
 - 📝 **Basic support** (version + checksum): `core` (some tools)
@@ -280,6 +280,17 @@ mise install
 # Set versions based on package.json
 mise use node@$(jq -r '.engines.node' package.json)
 ```
+
+## Minimum Release Age
+
+In addition to lockfiles, mise supports the [`install_before`](/configuration/settings.html#install_before) setting to limit supply chain risk by only installing versions that have been available for a minimum amount of time:
+
+```toml
+[settings]
+install_before = "7d"  # only resolve to versions released more than 7 days ago
+```
+
+This pairs well with lockfiles — use `install_before` to avoid picking up brand-new releases, and lockfiles to pin the exact versions you've vetted.
 
 ## See Also
 

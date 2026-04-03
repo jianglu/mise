@@ -3,11 +3,13 @@ use crate::cmd::CmdLineRunner;
 use crate::config::{Config, Settings, env_directive::EnvDirective};
 use crate::duration;
 use crate::file::{display_path, is_executable};
+use crate::sandbox::SandboxConfig;
 use crate::task::TaskKey;
 use crate::task::task_context_builder::TaskContextBuilder;
 use crate::task::task_list::split_task_spec;
 use crate::task::task_output::{TaskOutput, trunc};
 use crate::task::task_output_handler::OutputHandler;
+use crate::task::task_script_parser::subcommand_name_from_parse;
 use crate::task::task_source_checker::{save_checksum, sources_are_fresh, task_cwd};
 use crate::task::{Deps, FailedTasks, GetMatchingExt, Task};
 use crate::toolset::env_cache::CachedEnv;
@@ -58,6 +60,8 @@ pub struct TaskExecutorConfig {
     pub continue_on_error: bool,
     pub dry_run: bool,
     pub skip_deps: bool,
+    /// CLI-level sandbox overrides (merged with task-level sandbox config)
+    pub sandbox: crate::sandbox::SandboxConfig,
 }
 
 /// Executes tasks with proper context, environment, and output handling
@@ -75,6 +79,7 @@ pub struct TaskExecutor {
     pub continue_on_error: bool,
     pub dry_run: bool,
     pub skip_deps: bool,
+    pub sandbox: crate::sandbox::SandboxConfig,
 }
 
 impl TaskExecutor {
@@ -95,6 +100,7 @@ impl TaskExecutor {
             continue_on_error: config.continue_on_error,
             dry_run: config.dry_run,
             skip_deps: config.skip_deps,
+            sandbox: config.sandbox,
         }
     }
 
@@ -121,6 +127,42 @@ impl TaskExecutor {
 
     fn raw(&self, task: Option<&Task>) -> bool {
         self.output_handler.raw(task)
+    }
+
+    /// Build a SandboxConfig for a task by merging task-level config with CLI overrides.
+    fn build_sandbox_for_task(&self, task: &Task) -> SandboxConfig {
+        let mut config = SandboxConfig {
+            deny_read: task.deny_all || task.deny_read || self.sandbox.deny_read,
+            deny_write: task.deny_all || task.deny_write || self.sandbox.deny_write,
+            deny_net: task.deny_all || task.deny_net || self.sandbox.deny_net,
+            deny_env: task.deny_all || task.deny_env || self.sandbox.deny_env,
+            allow_read: task
+                .allow_read
+                .iter()
+                .chain(self.sandbox.allow_read.iter())
+                .cloned()
+                .collect(),
+            allow_write: task
+                .allow_write
+                .iter()
+                .chain(self.sandbox.allow_write.iter())
+                .cloned()
+                .collect(),
+            allow_net: task
+                .allow_net
+                .iter()
+                .chain(self.sandbox.allow_net.iter())
+                .cloned()
+                .collect(),
+            allow_env: task
+                .allow_env
+                .iter()
+                .chain(self.sandbox.allow_env.iter())
+                .cloned()
+                .collect(),
+        };
+        config.resolve_paths();
+        config
     }
 
     pub fn task_timings(&self) -> bool {
@@ -344,13 +386,33 @@ impl TaskExecutor {
                         self.exec_script(&script, &args, task, env, prefix).await?;
                     }
                 }
-                RunEntry::SingleTask { task: spec } => {
+                RunEntry::SingleTask {
+                    task: spec,
+                    args: entry_args,
+                    env: entry_env,
+                } => {
                     let resolved_spec = crate::task::resolve_task_pattern(spec, Some(task));
+                    let override_args = if entry_args.is_empty() {
+                        None
+                    } else {
+                        Some(entry_args.clone())
+                    };
+                    let override_env: Vec<(String, String)> = entry_env
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    let override_env_ref = if override_env.is_empty() {
+                        None
+                    } else {
+                        Some(override_env.as_slice())
+                    };
                     guard = None; // drop lock before waiting on sub-tasks
                     self.inject_and_wait(
                         config,
                         &[resolved_spec],
                         task_env,
+                        override_args.as_deref(),
+                        override_env_ref,
                         sched_tx.clone(),
                         completed_tasks,
                     )
@@ -366,6 +428,8 @@ impl TaskExecutor {
                         config,
                         &resolved_tasks,
                         task_env,
+                        None,
+                        None,
                         sched_tx.clone(),
                         completed_tasks,
                     )
@@ -376,11 +440,14 @@ impl TaskExecutor {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn inject_and_wait(
         &self,
         config: &Arc<Config>,
         specs: &[String],
         task_env: &[(String, String)],
+        override_args: Option<&[String]>,
+        override_env: Option<&[(String, String)]>,
         sched_tx: Arc<mpsc::UnboundedSender<(Task, Arc<Mutex<Deps>>)>>,
         completed_tasks: &HashSet<TaskKey>,
     ) -> Result<()> {
@@ -410,7 +477,32 @@ impl TaskExecutor {
             ensure!(!matches.is_empty(), "task not found: {}", name);
             for t in matches {
                 let mut t = (*t).clone();
-                t.args = args.clone();
+                t.args = override_args
+                    .map(|a| a.to_vec())
+                    .unwrap_or_else(|| args.clone());
+                // Apply entry-level env via with_dependency_env (high priority,
+                // consistent with depends/depends_post) so it overrides the
+                // sub-task's own declared env.
+                if let Some(env) = override_env {
+                    let env_directives: Vec<EnvDirective> = env
+                        .iter()
+                        .map(|(k, v)| EnvDirective::Val(k.clone(), v.clone(), Default::default()))
+                        .collect();
+                    t = t.with_dependency_env(&env_directives);
+                    if let Some(config_root) = &t.config_root {
+                        let env_map: IndexMap<String, String> = env.iter().cloned().collect();
+                        t.outputs.re_render_with_env(
+                            &t.raw_outputs.clone(),
+                            &env_map,
+                            config_root,
+                        )?;
+                    } else {
+                        trace!(
+                            "re_render_with_env skipped: task {} has no config_root",
+                            t.name
+                        );
+                    }
+                }
                 if self.skip_deps {
                     t.depends.clear();
                     t.depends_post.clear();
@@ -713,11 +805,19 @@ impl TaskExecutor {
         let program = program.to_executable();
         let redactions = config.redactions();
         let raw = self.raw(Some(task));
+        let sandbox = self.build_sandbox_for_task(task);
+        let env = if sandbox.is_active() {
+            Settings::get().ensure_experimental("sandbox")?;
+            &sandbox.filter_env(env)
+        } else {
+            env
+        };
         let mut cmd = CmdLineRunner::new(program.clone())
             .args(args)
             .envs(env)
             .redact(redactions.deref().clone())
-            .raw(raw);
+            .raw(raw)
+            .with_sandbox(sandbox);
         if raw && !redactions.is_empty() {
             if task.interactive && !task.raw && !Settings::get().raw {
                 hint!(
@@ -874,6 +974,8 @@ impl TaskExecutor {
         if let Some(timeout) = effective_timeout {
             cmd = cmd.with_timeout(timeout);
         }
+        // Apply sandbox async (DNS resolution for macOS) before blocking execute
+        cmd.apply_sandbox().await?;
         // cmd.execute() is blocking (calls cp.wait()), so use block_in_place
         // to avoid starving the tokio runtime while holding the TASK_RUNTIME_LOCK guard.
         tokio::task::block_in_place(|| cmd.execute())?;
@@ -941,7 +1043,10 @@ impl TaskExecutor {
         let (spec, _) = task
             .parse_usage_spec_with_vars(config, self.cd.clone(), env, extra_vars)
             .await?;
-        if !spec.cmd.args.is_empty() || !spec.cmd.flags.is_empty() {
+        if !spec.cmd.args.is_empty()
+            || !spec.cmd.flags.is_empty()
+            || !spec.cmd.subcommands.is_empty()
+        {
             let args: Vec<String> = get_args();
             trace!("Parsing usage spec for {:?}", args);
             // Pass env vars to Parser so it can resolve env= defaults in usage specs
@@ -955,8 +1060,17 @@ impl TaskExecutor {
                 trace!("Adding key {} value {} in env", k, v);
                 env.insert(k, v);
             }
+            // always export $usage_cmd when spec has subcommands so
+            // shell scripts with `set -u` don't fail when none is chosen
+            if !spec.cmd.subcommands.is_empty() {
+                env.entry("usage_cmd".to_string()).or_default();
+            }
+            if let Some(subcmd) = subcommand_name_from_parse(&po.cmds) {
+                trace!("Adding key usage_cmd value {} in env", subcmd);
+                env.insert("usage_cmd".to_string(), subcmd);
+            }
         } else {
-            trace!("Usage spec has no args or flags");
+            trace!("Usage spec has no args, flags, or subcommands");
         }
 
         Ok(())

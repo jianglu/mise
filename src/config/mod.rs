@@ -388,7 +388,7 @@ impl Config {
             .get(plugin_name)
             .map(|full| registry::full_to_url(&full[0]))
             .or_else(|| {
-                if plugin_name.starts_with("https://") || plugin_name.split('/').count() == 2 {
+                if registry::url_like(plugin_name) || plugin_name.split('/').count() == 2 {
                     Some(registry::full_to_url(plugin_name))
                 } else {
                     None
@@ -794,7 +794,16 @@ impl Config {
             .map(|(p, cf)| {
                 let mut watch_files: Vec<WatchFilePattern> = vec![p.as_path().into()];
                 if let Some(parent) = p.parent() {
-                    watch_files.push(parent.join("mise.lock").into());
+                    let lockfile = parent.join("mise.lock");
+
+                    // Only watch lockfiles that currently exist to prevent missing optional
+                    // mise.lock files from keeping hook-env from stabilizing. If one is created
+                    // later, should_exit_early_fast() will notice the parent directory mtime
+                    // change, force a slow-path run, and this watch set will then include the new
+                    // lockfile on that recomputation.
+                    if lockfile.exists() {
+                        watch_files.push(lockfile.into());
+                    }
                 }
                 watch_files.extend(cf.watch_files()?.iter().map(|wf| WatchFilePattern {
                     root: cf.project_root().map(|pr| pr.to_path_buf()),
@@ -807,6 +816,7 @@ impl Config {
             .flatten()
             .chain(env_results.env_files.iter().map(|p| p.as_path().into()))
             .chain(env_results.env_scripts.iter().map(|p| p.as_path().into()))
+            .chain(env_results.watch_files.iter().map(|p| p.as_path().into()))
             .chain(
                 Settings::get()
                     .env_files()
@@ -1151,13 +1161,22 @@ pub fn load_config_paths(config_filenames: &[String], include_ignored: bool) -> 
 
 /// Load config hierarchy from a specific directory (for monorepo tasks)
 /// This loads all config files from start_dir up through parent directories,
-/// including MISE_ENV-specific configs
-pub fn load_config_hierarchy_from_dir(start_dir: &Path) -> Result<Vec<PathBuf>> {
+/// including MISE_ENV-specific configs and idiomatic version files.
+/// Returns (paths, idiomatic_filenames) so callers can pass the map to
+/// load_config_files_from_paths without a redundant second computation.
+pub async fn load_config_hierarchy_from_dir(
+    start_dir: &Path,
+) -> Result<(Vec<PathBuf>, BTreeMap<String, Vec<String>>)> {
     if Settings::no_config() {
-        return Ok(vec![]);
+        return Ok((vec![], BTreeMap::new()));
     }
 
-    let config_filenames = DEFAULT_CONFIG_FILENAMES.iter().cloned().collect_vec();
+    let idiomatic_files = load_idiomatic_filenames().await;
+    let config_filenames: Vec<String> = idiomatic_files
+        .keys()
+        .cloned()
+        .chain(DEFAULT_CONFIG_FILENAMES.iter().cloned())
+        .collect();
 
     // Get all directories from start_dir up to root/ceiling
     let dirs = all_dirs_from(start_dir)?;
@@ -1195,7 +1214,7 @@ pub fn load_config_hierarchy_from_dir(start_dir: &Path) -> Result<Vec<PathBuf>> 
         })
         .collect();
 
-    Ok(paths)
+    Ok((paths, idiomatic_files))
 }
 
 pub fn is_global_config(path: &Path) -> bool {
@@ -1432,16 +1451,20 @@ async fn load_all_config_files(
 }
 
 /// Load config files from a list of paths (for monorepo task config contexts)
-pub async fn load_config_files_from_paths(config_paths: &[PathBuf]) -> Result<ConfigMap> {
+/// Accepts a pre-computed idiomatic filenames map to avoid redundant computation
+/// when called after load_config_hierarchy_from_dir.
+pub async fn load_config_files_from_paths(
+    config_paths: &[PathBuf],
+    idiomatic_filenames: &BTreeMap<String, Vec<String>>,
+) -> Result<ConfigMap> {
     backend::load_tools().await?;
-    let idiomatic_filenames = load_idiomatic_filenames().await;
     let mut config_map = ConfigMap::default();
 
     for f in config_paths.iter().unique() {
         if f.is_dir() {
             continue;
         }
-        let cf = match parse_config_file(f, &idiomatic_filenames).await {
+        let cf = match parse_config_file(f, idiomatic_filenames).await {
             Ok(cfg) => cfg,
             Err(err) => {
                 return Err(err.wrap_err(format!(
@@ -1690,9 +1713,9 @@ pub async fn rebuild_shims_and_runtime_symlinks(
     });
     if !new_versions.is_empty() {
         measure!("auto-locking platforms", {
-            if let Err(e) = lockfile::auto_lock_new_versions(config, new_versions).await {
-                warn!("failed to auto-lock platforms for new versions: {e}");
-            }
+            lockfile::auto_lock_new_versions(config, new_versions)
+                .await
+                .wrap_err("failed to auto-lock platforms for new versions")?;
         });
     }
 
@@ -1844,7 +1867,7 @@ async fn load_local_tasks_with_context(
                         let includes = task_includes_for_dir(&subdir, &config.config_files);
                         for include in includes {
                             let mut subdir_tasks =
-                                load_tasks_includes(&config, &include, &subdir).await?;
+                                load_tasks_includes(&config, &include, &subdir, &None).await?;
                             if is_global_task_include_path(&include) {
                                 mark_tasks_as_global(&mut subdir_tasks);
                             }
@@ -2183,9 +2206,10 @@ async fn load_tasks_includes(
     config: &Arc<Config>,
     root: &Path,
     config_root: &Path,
+    task_config_dir: &Option<String>,
 ) -> Result<Vec<Task>> {
     if root.is_file() && root.extension().map(|e| e == "toml").unwrap_or(false) {
-        load_task_file(config, root, config_root).await
+        load_task_file(config, root, config_root, task_config_dir).await
     } else if root.is_dir() {
         let files = WalkDir::new(root)
             .follow_links(true)
@@ -2212,7 +2236,15 @@ async fn load_tasks_includes(
             let root = root.clone();
             let config_root = config_root.clone();
             let config = config.clone();
-            tasks.push(Task::from_path(&config, &path, &root, &config_root).await?);
+            let mut task = Task::from_path(&config, &path, &root, &config_root).await?;
+            if task.dir.is_none()
+                && let Some(ref dir) = *task_config_dir
+            {
+                let mut tera = crate::tera::get_tera(Some(config_root.as_ref()));
+                let tera_ctx = task.tera_ctx(&config).await?;
+                task.dir = Some(tera.render_str(dir, &tera_ctx)?);
+            }
+            tasks.push(task);
         }
         Ok(tasks)
     } else {
@@ -2290,6 +2322,7 @@ async fn load_file_tasks(
     let mut tasks = vec![];
     let config_root = Arc::new(config_root.to_path_buf());
     let cf_root = cf.config_root();
+    let task_config_dir = cf.task_config().dir.clone();
 
     for include in includes {
         let paths = if include.starts_with("git::") {
@@ -2298,7 +2331,8 @@ async fn load_file_tasks(
             expand_task_include(&cf_root, &include)
         };
         for path in paths {
-            let mut loaded = load_tasks_includes(config, &path, &config_root).await?;
+            let mut loaded =
+                load_tasks_includes(config, &path, &config_root, &task_config_dir).await?;
             if is_global_task_include_path(&path) {
                 mark_tasks_as_global(&mut loaded);
             }
@@ -2363,9 +2397,15 @@ pub async fn load_tasks_in_dir(
         config_tasks.extend(load_config_tasks(config, (*cf).clone(), &dir, templates).await?);
     }
 
+    // Find task_config.dir from the nearest config that defines it
+    let task_config_dir = configs
+        .iter()
+        .rev()
+        .find_map(|cf| cf.task_config().dir.clone());
+
     let mut file_tasks = vec![];
     for p in task_includes_for_dir(dir, config_files) {
-        let mut loaded = load_tasks_includes(config, &p, dir).await?;
+        let mut loaded = load_tasks_includes(config, &p, dir, &task_config_dir).await?;
         if is_global_task_include_path(&p) {
             mark_tasks_as_global(&mut loaded);
         }
@@ -2374,7 +2414,8 @@ pub async fn load_tasks_in_dir(
 
     for include in git_includes {
         let resolved = resolve_git_url_to_path(&include).await?;
-        file_tasks.extend(load_tasks_includes(config, &resolved, dir).await?);
+        let loaded = load_tasks_includes(config, &resolved, dir, &task_config_dir).await?;
+        file_tasks.extend(loaded);
     }
 
     let mut tasks = file_tasks
@@ -2397,6 +2438,7 @@ async fn load_task_file(
     config: &Arc<Config>,
     path: &Path,
     config_root: &Path,
+    task_config_dir: &Option<String>,
 ) -> Result<Vec<Task>> {
     let raw = file::read_to_string_async(path).await?;
     let mut tasks = toml::from_str::<Tasks>(&raw)
@@ -2406,6 +2448,9 @@ async fn load_task_file(
         task.name = name.clone();
         task.config_source = path.to_path_buf();
         task.config_root = Some(config_root.to_path_buf());
+        if task.dir.is_none() {
+            task.dir = task_config_dir.clone();
+        }
     }
     let mut out = vec![];
     for (_, mut task) in tasks {
@@ -2472,6 +2517,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_repo_url_ssh() -> Result<()> {
+        let config = Config::reset().await?;
+        let urls = [
+            "ssh://git@gitlab.dev/mobile/asdf-gitique.git",
+            "git@github.com:user/repo.git",
+            "git://example.com/repo.git",
+            "http://example.com/repo.git",
+            "https://example.com/repo.git",
+        ];
+
+        for url in urls {
+            assert!(
+                config.get_repo_url(url).is_some(),
+                "URL should be considered valid: {url}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_load_task_file_supports_per_task_vars() -> Result<()> {
         let config = Config::reset().await?;
         let temp_dir = TempDir::new()?;
@@ -2486,7 +2551,7 @@ vars = { target = "linux" }
 "#,
         )?;
 
-        let tasks = load_task_file(&config, &tasks_toml, temp_dir.path()).await?;
+        let tasks = load_task_file(&config, &tasks_toml, temp_dir.path(), &None).await?;
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].name, "build");
         assert_eq!(tasks[0].description, "linux");

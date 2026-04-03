@@ -62,7 +62,7 @@ pub mod task_tool_installer;
 
 pub use task_load_context::{TaskLoadContext, expand_colon_task_syntax};
 pub use task_output::TaskOutput;
-pub use task_script_parser::has_any_args_defined;
+pub use task_script_parser::{has_any_args_defined, has_any_usage_spec};
 pub use task_template::TaskTemplate;
 
 use crate::config::config_file::ConfigFile;
@@ -74,15 +74,47 @@ pub use deps::{Deps, TaskKey};
 use task_dep::TaskDep;
 use task_sources::{RawOutputTemplates, TaskOutputs};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RunEntry {
     /// Shell script entry
     Script(String),
-    /// Run a single task with optional args
-    SingleTask { task: String },
+    /// Run a single task with optional args and env
+    SingleTask {
+        task: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
+        #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+        env: IndexMap<String, String>,
+    },
     /// Run multiple tasks in parallel
     TaskGroup { tasks: Vec<String> },
+}
+
+impl std::hash::Hash for RunEntry {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            RunEntry::Script(s) => {
+                0u8.hash(state);
+                s.hash(state);
+            }
+            RunEntry::SingleTask { task, args, env } => {
+                1u8.hash(state);
+                task.hash(state);
+                args.hash(state);
+                let mut pairs: Vec<_> = env.iter().collect();
+                pairs.sort_by_key(|(k, _)| k.as_str());
+                for (k, v) in pairs {
+                    k.hash(state);
+                    v.hash(state);
+                }
+            }
+            RunEntry::TaskGroup { tasks } => {
+                2u8.hash(state);
+                tasks.hash(state);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
@@ -199,7 +231,16 @@ impl Display for RunEntry {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             RunEntry::Script(s) => write!(f, "{}", s),
-            RunEntry::SingleTask { task } => write!(f, "task: {task}"),
+            RunEntry::SingleTask { task, args, env } => {
+                for (k, v) in env {
+                    write!(f, "{}={} ", k, v)?;
+                }
+                write!(f, "task: {task}")?;
+                if !args.is_empty() {
+                    write!(f, " {}", args.join(" "))?;
+                }
+                Ok(())
+            }
             RunEntry::TaskGroup { tasks } => write!(f, "tasks: {}", tasks.join(", ")),
         }
     }
@@ -289,6 +330,34 @@ pub struct Task {
     // This is used to determine if the task should use monorepo config file context
     #[serde(skip)]
     pub remote_file_source: Option<String>,
+
+    /// Block reads, writes, network, and env vars
+    #[serde(default)]
+    pub deny_all: bool,
+    /// Block filesystem reads
+    #[serde(default)]
+    pub deny_read: bool,
+    /// Block all filesystem writes
+    #[serde(default)]
+    pub deny_write: bool,
+    /// Block all network access
+    #[serde(default)]
+    pub deny_net: bool,
+    /// Block env var inheritance
+    #[serde(default)]
+    pub deny_env: bool,
+    /// Allow reads from specific paths
+    #[serde(default)]
+    pub allow_read: Vec<std::path::PathBuf>,
+    /// Allow writes to specific paths
+    #[serde(default)]
+    pub allow_write: Vec<std::path::PathBuf>,
+    /// Allow network to specific hosts
+    #[serde(default)]
+    pub allow_net: Vec<String>,
+    /// Allow specific env vars through
+    #[serde(default)]
+    pub allow_env: Vec<String>,
 
     /// Name of the task template to extend (requires experimental = true)
     #[serde(default)]
@@ -894,8 +963,11 @@ impl Task {
         }
 
         let task_dir = task_cf.get_path().parent().unwrap_or(task_cf.get_path());
-        let config_paths = crate::config::load_config_hierarchy_from_dir(task_dir)?;
-        let task_config_files = crate::config::load_config_files_from_paths(&config_paths).await?;
+        let (config_paths, idiomatic_filenames) =
+            crate::config::load_config_hierarchy_from_dir(task_dir).await?;
+        let task_config_files =
+            crate::config::load_config_files_from_paths(&config_paths, &idiomatic_filenames)
+                .await?;
         let vars_results =
             crate::config::resolve_vars_from_config_files(config, &task_config_files).await?;
         let vars: IndexMap<String, String> = vars_results
@@ -1290,6 +1362,15 @@ impl Default for Task {
             usage: "".to_string(),
             timeout: None,
             remote_file_source: None,
+            deny_all: false,
+            deny_read: false,
+            deny_write: false,
+            deny_net: false,
+            deny_env: false,
+            allow_read: vec![],
+            allow_write: vec![],
+            allow_net: vec![],
+            allow_env: vec![],
             extends: None,
             show_args_in_prefix: false,
         }
@@ -2518,5 +2599,43 @@ echo "test"
         // Bare name "test" should still match the "test" task (implicit wildcard)
         let matches = tasks.get_matching("test").unwrap();
         assert!(matches.contains(&&"test".to_string()));
+    }
+
+    #[test]
+    fn test_get_matching_resolves_aliases() {
+        use std::collections::BTreeMap;
+
+        use super::GetMatchingExt;
+
+        let mut tasks: BTreeMap<String, String> = BTreeMap::new();
+        tasks.insert("pr:remove".to_string(), "pr:remove".to_string());
+        tasks.insert("prr".to_string(), "pr:remove".to_string());
+
+        let matches = tasks.get_matching("prr").unwrap();
+        assert_eq!(matches, vec![&"pr:remove".to_string()]);
+
+        let matches = tasks.get_matching("pr:remove").unwrap();
+        assert_eq!(matches, vec![&"pr:remove".to_string()]);
+    }
+
+    #[test]
+    fn test_get_matching_resolves_monorepo_aliases() {
+        use std::collections::BTreeMap;
+
+        use super::GetMatchingExt;
+
+        let mut tasks: BTreeMap<String, String> = BTreeMap::new();
+        tasks.insert("//:pr:remove".to_string(), "//:pr:remove".to_string());
+        tasks.insert("//:prr".to_string(), "//:pr:remove".to_string());
+        tasks.insert("prr".to_string(), "//:pr:remove".to_string());
+
+        let matches = tasks.get_matching("//:prr").unwrap();
+        assert_eq!(matches, vec![&"//:pr:remove".to_string()]);
+
+        let matches = tasks.get_matching("prr").unwrap();
+        assert_eq!(matches, vec![&"//:pr:remove".to_string()]);
+
+        let matches = tasks.get_matching("//:pr:remove").unwrap();
+        assert_eq!(matches, vec![&"//:pr:remove".to_string()]);
     }
 }

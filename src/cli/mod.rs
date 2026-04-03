@@ -27,6 +27,7 @@ pub mod exec;
 mod external;
 mod fmt;
 mod generate;
+mod github;
 mod global;
 mod hook_env;
 mod hook_not_found;
@@ -112,17 +113,12 @@ pub struct Cli {
     /// Force the operation
     #[clap(long, short, hide = true)]
     pub force: bool,
-    /// Set the log output verbosity
-    #[clap(long, short, hide = true, overrides_with = "prefix")]
-    pub interleave: bool,
     /// How many jobs to run in parallel [default: 8]
     #[clap(long, short, global = true, env = "MISE_JOBS")]
     pub jobs: Option<usize>,
     /// Dry run, don't actually do anything
     #[clap(short = 'n', long, hide = true)]
     pub dry_run: bool,
-    #[clap(long, short, hide = true, overrides_with = "interleave")]
-    pub prefix: bool,
     /// Set the profile (environment)
     #[clap(short = 'P', long, global = true, hide = true, conflicts_with = "env")]
     pub profile: Option<Vec<String>>,
@@ -219,6 +215,7 @@ pub enum Commands {
     Exec(exec::Exec),
     Fmt(fmt::Fmt),
     Generate(generate::Generate),
+    Github(github::Github),
     Global(global::Global),
     HookEnv(hook_env::HookEnv),
     HookNotFound(hook_not_found::HookNotFound),
@@ -287,6 +284,7 @@ impl Commands {
             Self::Exec(cmd) => cmd.run().await,
             Self::Fmt(cmd) => cmd.run(),
             Self::Generate(cmd) => cmd.run().await,
+            Self::Github(cmd) => cmd.run().await,
             Self::Global(cmd) => cmd.run().await,
             Self::HookEnv(cmd) => cmd.run().await,
             Self::HookNotFound(cmd) => cmd.run().await,
@@ -652,12 +650,10 @@ impl Cli {
                         continue_on_error: self.continue_on_error,
                         dry_run: self.dry_run,
                         force: self.force,
-                        interleave: self.interleave,
                         is_linear: false,
                         jobs: self.jobs,
                         no_timings: self.no_timings,
                         output: self.output,
-                        prefix: self.prefix,
                         shell: self.shell,
                         quiet: self.quiet,
                         silent: self.silent,
@@ -671,8 +667,18 @@ impl Cli {
                         no_cache: Default::default(),
                         timeout: None,
                         skip_deps: false,
+                        skip_tools: false,
                         no_prepare: false,
                         fresh_env: false,
+                        deny_all: false,
+                        deny_read: false,
+                        deny_write: false,
+                        deny_net: false,
+                        deny_env: false,
+                        allow_read: vec![],
+                        allow_write: vec![],
+                        allow_net: vec![],
+                        allow_env: vec![],
                     })));
                 } else if let Some(cmd) = external::COMMANDS.get(&task) {
                     external::execute(

@@ -148,6 +148,34 @@ export MISE_AQUA_GITHUB_ATTESTATIONS=false
 export MISE_AQUA_MINISIGN=false
 ```
 
+## Minimum release age
+
+To limit supply chain risk, you can restrict mise to only install versions released before a certain date or duration. This is similar to Renovate's [minimum release age](https://docs.renovatebot.com/key-concepts/minimum-release-age/) concept — newly published versions are ignored until they've been available for a configurable amount of time.
+
+```toml
+# mise.toml
+[settings]
+install_before = "7d"  # only install versions released more than 7 days ago
+```
+
+Supports relative durations (`7d`, `6m`, `1y`) and absolute dates (`2024-06-01`). Only affects fuzzy version resolution (e.g., `node@20` or `latest`) — explicitly pinned versions like `node@22.5.0` bypass the filter.
+
+You can also set `install_before` per-tool to override the global setting:
+
+```toml
+# mise.toml
+[settings]
+install_before = "7d"  # default for all tools
+
+[tools.trivy]
+version = "latest"
+install_before = "1d"  # trivy updates are time-sensitive, use a shorter window
+```
+
+Precedence: `--before` CLI flag > per-tool `install_before` > global `install_before` setting.
+
+See [`install_before`](/configuration/settings.html#install_before) for more details.
+
 ## [`mise up --bump`](/cli/upgrade.html)
 
 Use `mise up --bump` to upgrade all software to the latest version and update `mise.toml` files. This keeps the same semver range as before,
@@ -234,7 +262,7 @@ to go with it.
 When you use a lockfile (`mise.lock`), mise stores the exact download URLs for each tool asset. This means that after the initial install, future `mise install` runs will use the URLs from the lockfile instead of making API calls to GitHub (or other providers). This has several benefits:
 
 - **Avoids GitHub API rate limits**: No need to make repeated API calls for every install, which can quickly exhaust your rate limit, especially in CI or large teams.
-- **No need for GITHUB_TOKEN**: Since the URLs are already known, you don’t need to set up a `GITHUB_TOKEN` for simple installs.
+- **No need for GITHUB_TOKEN**: Since the URLs are already known, you don’t need to set up a `GITHUB_TOKEN` for simple installs. See [GitHub Tokens](/dev-tools/github-tokens.html) for more on token configuration.
 - **Faster installs**: Skipping API lookups speeds up repeated installs.
 
 This is especially useful in CI/CD or when working in environments with strict network or authentication requirements.

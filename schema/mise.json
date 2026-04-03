@@ -739,6 +739,16 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
+            "credential_command": {
+              "default": "",
+              "description": "Shell command to run to obtain a GitHub token for mise.",
+              "type": "string"
+            },
+            "gh_cli_tokens": {
+              "default": true,
+              "description": "Read GitHub tokens from the gh CLI's hosts.yml config.",
+              "type": "boolean"
+            },
             "github_attestations": {
               "default": true,
               "description": "Enable GitHub Artifact Attestations verification for github backend tools.",
@@ -747,6 +757,11 @@
             "slsa": {
               "default": true,
               "description": "Enable SLSA provenance verification for github backend tools.",
+              "type": "boolean"
+            },
+            "use_git_credentials": {
+              "default": false,
+              "description": "Use git credential helpers to obtain GitHub tokens.",
               "type": "boolean"
             }
           }
@@ -863,7 +878,7 @@
           }
         },
         "install_before": {
-          "description": "Only install versions released before this date",
+          "description": "Minimum release age / supply chain protection — only install versions released before this date",
           "type": "string"
         },
         "java": {
@@ -1105,6 +1120,10 @@
             "default_packages_file": {
               "description": "Path to a file containing default python packages to install when installing a python version.",
               "type": "string"
+            },
+            "github_attestations": {
+              "description": "Enable GitHub Artifact Attestations verification for precompiled Python binaries.",
+              "type": "boolean"
             },
             "patch_url": {
               "description": "URL to fetch python patches from to pass to python-build.",
@@ -1633,8 +1652,22 @@
           "additionalProperties": false,
           "properties": {
             "task": {
-              "description": "single task name (with optional args) to run",
+              "description": "single task name to run",
               "type": "string"
+            },
+            "args": {
+              "description": "arguments to pass to the task",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "env": {
+              "description": "environment variables to set for the task",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": ["task"]

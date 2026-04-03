@@ -11,7 +11,7 @@ use crate::duration;
 use crate::env;
 use crate::file::display_path;
 use crate::prepare::{PrepareEngine, PrepareOptions};
-use crate::task::has_any_args_defined;
+use crate::task::has_any_usage_spec;
 use crate::task::task_helpers::task_needs_permit;
 use crate::task::task_list::{get_task_lists, resolve_depends};
 use crate::task::task_output::TaskOutput;
@@ -82,18 +82,6 @@ pub struct Run {
     #[clap(long, short, verbatim_doc_comment)]
     pub force: bool,
 
-    /// Print directly to stdout/stderr instead of by line
-    /// Defaults to true if --jobs == 1
-    /// Configure with `task.output` config or `MISE_TASK_OUTPUT` env var
-    #[clap(
-        long,
-        short,
-        verbatim_doc_comment,
-        hide = true,
-        overrides_with = "prefix"
-    )]
-    pub interleave: bool,
-
     /// Number of tasks to run in parallel
     /// [default: 4]
     /// Configure with `jobs` config or `MISE_JOBS` env var
@@ -115,18 +103,6 @@ pub struct Run {
     /// - `silent` - Don't show any output including stdout and stderr from the task except for errors
     #[clap(short, long, verbatim_doc_comment, env = "MISE_TASK_OUTPUT")]
     pub output: Option<TaskOutput>,
-
-    /// Print stdout/stderr by line, prefixed with the task's label
-    /// Defaults to true if --jobs > 1
-    /// Configure with `task.output` config or `MISE_TASK_OUTPUT` env var
-    #[clap(
-        long,
-        short,
-        verbatim_doc_comment,
-        hide = true,
-        overrides_with = "interleave"
-    )]
-    pub prefix: bool,
 
     /// Don't show extra output
     #[clap(long, short, verbatim_doc_comment, env = "MISE_QUIET")]
@@ -158,6 +134,42 @@ pub struct Run {
     #[clap(skip)]
     pub is_linear: bool,
 
+    /// [experimental] Allow specific env var through (implies --deny-env for everything else)
+    #[clap(long, value_name = "VAR", verbatim_doc_comment)]
+    pub allow_env: Vec<String>,
+
+    /// [experimental] Allow network to specific host (implies --deny-net for everything else)
+    #[clap(long, value_name = "HOST", verbatim_doc_comment)]
+    pub allow_net: Vec<String>,
+
+    /// [experimental] Allow reads from specific path (implies --deny-read for everything else)
+    #[clap(long, value_name = "PATH", verbatim_doc_comment)]
+    pub allow_read: Vec<std::path::PathBuf>,
+
+    /// [experimental] Allow writes to specific path (implies --deny-write for everything else)
+    #[clap(long, value_name = "PATH", verbatim_doc_comment)]
+    pub allow_write: Vec<std::path::PathBuf>,
+
+    /// [experimental] Block reads, writes, network, and env vars
+    #[clap(long, verbatim_doc_comment)]
+    pub deny_all: bool,
+
+    /// [experimental] Block env var inheritance (only PATH, HOME, USER, SHELL, TERM, LANG pass through)
+    #[clap(long, verbatim_doc_comment)]
+    pub deny_env: bool,
+
+    /// [experimental] Block all network access
+    #[clap(long, verbatim_doc_comment)]
+    pub deny_net: bool,
+
+    /// [experimental] Block filesystem reads (system libs and tool dirs still accessible)
+    #[clap(long, verbatim_doc_comment)]
+    pub deny_read: bool,
+
+    /// [experimental] Block all filesystem writes
+    #[clap(long, verbatim_doc_comment)]
+    pub deny_write: bool,
+
     /// Bypass the environment cache and recompute the environment
     #[clap(long)]
     pub fresh_env: bool,
@@ -179,6 +191,13 @@ pub struct Run {
     /// Run only the specified tasks skipping all dependencies
     #[clap(long, verbatim_doc_comment, env = "MISE_TASK_SKIP_DEPENDS")]
     pub skip_deps: bool,
+
+    /// Skip installing tools before running tasks
+    ///
+    /// Can also be set persistently with the `task.run_auto_install` setting
+    /// or `MISE_TASK_RUN_AUTO_INSTALL=false` env var
+    #[clap(long, verbatim_doc_comment)]
+    pub skip_tools: bool,
 
     /// Timeout for the task to complete
     /// e.g.: 30s, 5m
@@ -250,8 +269,8 @@ impl Run {
                 // Get usage spec to check if task has defined args/flags
                 let spec = task.parse_usage_spec_for_display(&config).await?;
 
-                if has_any_args_defined(&spec) {
-                    // Task has usage args/flags defined, render help using usage library
+                if has_any_usage_spec(&spec) {
+                    // Task has usage spec defined, render help using usage library
                     println!("{}", usage::docs::cli::render_help(&spec, &spec.cmd, true));
                 } else {
                     // Task has no usage defined, show basic task info
@@ -280,7 +299,9 @@ impl Run {
                 || !Settings::get().auto_install,
             ..Default::default()
         };
-        let _ = ts.install_missing_versions(&mut config, &opts).await?;
+        if !self.skip_tools {
+            let _ = ts.install_missing_versions(&mut config, &opts).await?;
+        }
 
         if !self.skip_deps {
             self.skip_deps = Settings::get().task.skip_depends;
@@ -372,7 +393,9 @@ impl Run {
         self.output = Some(self.output(None));
 
         // Step 3: Install tools needed by tasks
-        self.install_task_tools(&mut config, &tasks).await?;
+        if !self.skip_tools {
+            self.install_task_tools(&mut config, &tasks).await?;
+        }
 
         // Step 4: Create TaskExecutor after tool installation
         self.setup_executor()?;
@@ -542,8 +565,6 @@ impl Run {
     fn setup_output_and_validate(&mut self, tasks: &Deps) -> Result<()> {
         // Initialize OutputHandler AFTER is_linear is determined
         let output_config = crate::task::task_output_handler::OutputHandlerConfig {
-            prefix: self.prefix,
-            interleave: self.interleave,
             output: self.output,
             silent: self.silent,
             quiet: self.quiet,
@@ -598,6 +619,16 @@ impl Run {
             continue_on_error: self.continue_on_error,
             dry_run: self.dry_run,
             skip_deps: self.skip_deps,
+            sandbox: crate::sandbox::SandboxConfig {
+                deny_read: self.deny_all || self.deny_read,
+                deny_write: self.deny_all || self.deny_write,
+                deny_net: self.deny_all || self.deny_net,
+                deny_env: self.deny_all || self.deny_env,
+                allow_read: self.allow_read.clone(),
+                allow_write: self.allow_write.clone(),
+                allow_net: self.allow_net.clone(),
+                allow_env: self.allow_env.clone(),
+            },
         };
         self.executor = Some(crate::task::task_executor::TaskExecutor::new(
             self.context_builder.clone(),

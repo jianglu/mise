@@ -340,9 +340,10 @@ impl Backend for AquaBackend {
         // Validate lockfile URL matches expected asset pattern from registry
         // This handles cases where the registry format changed (e.g., raw binary -> tar.gz)
         // Only validate for GithubRelease packages - other types use fixed URL formats
+        // In locked mode, trust the lockfile URL without validation to avoid API calls
         let validated_url = if let Some(ref url) = existing_platform {
-            if pkg.r#type != AquaPackageType::GithubRelease {
-                existing_platform // Skip validation for non-release package types
+            if ctx.locked || pkg.r#type != AquaPackageType::GithubRelease {
+                existing_platform // Trust lockfile URL in locked mode or for non-release types
             } else {
                 let cached_filename = get_filename_from_url(url);
                 let cached_filename_lower = cached_filename.to_lowercase();
@@ -399,6 +400,12 @@ impl Backend for AquaBackend {
                 tv.version.clone()
             };
             (url, v, filename, None)
+        } else if ctx.locked {
+            bail!(
+                "No lockfile URL found for {} on platform {} (--locked mode requires pre-resolved URLs)",
+                self.id,
+                platform_key
+            );
         } else {
             let (url, v, digest) = if let Some(v_prefixed) = v_prefixed {
                 // Try v-prefixed version first because most aqua packages use v-prefixed versions
@@ -472,6 +479,20 @@ impl Backend for AquaBackend {
         }
 
         let install_path = tv.install_path();
+
+        // For linked versions (external symlinks created via `mise link`),
+        // skip aqua registry lookup — the linked install has its own layout.
+        if let Ok(Some(target)) = file::resolve_symlink(&install_path)
+            && target.is_absolute()
+        {
+            let bin = install_path.join("bin");
+            return Ok(if bin.is_dir() {
+                vec![bin]
+            } else {
+                vec![install_path]
+            });
+        }
+
         let cache: CacheManager<Vec<PathBuf>> =
             CacheManagerBuilder::new(tv.cache_path().join("bin_paths.msgpack.z"))
                 .with_fresh_file(install_path.clone())
@@ -496,7 +517,7 @@ impl Backend for AquaBackend {
                     .into_iter()
                     .unique()
                     .filter(|p| p.exists())
-                    .map(|p| p.strip_prefix(&install_path).unwrap().to_path_buf())
+                    .filter_map(|p| p.strip_prefix(&install_path).ok().map(|p| p.to_path_buf()))
                     .collect())
             })
             .await?
@@ -987,6 +1008,35 @@ impl AquaBackend {
         v: &str,
         filename: &str,
     ) -> Result<()> {
+        // Skip provenance verification if the lockfile already has both a checksum and
+        // provenance entry for this platform — the artifact integrity is already guaranteed
+        // by the checksum, so re-verifying attestations would just be redundant API calls.
+        // However, still check that the recorded provenance type's setting is enabled —
+        // disabling a verification setting with a provenance-bearing lockfile is a downgrade.
+        let platform_key = self.get_platform_key();
+        let has_lockfile_integrity = tv
+            .lock_platforms
+            .get(&platform_key)
+            .is_some_and(|pi| pi.checksum.is_some() && pi.provenance.is_some());
+        if has_lockfile_integrity {
+            self.ensure_provenance_setting_enabled(tv, &platform_key)?;
+        } else {
+            self.verify_provenance(ctx, tv, pkg, v, filename).await?;
+        }
+
+        let tarball_path = tv.download_path().join(filename);
+        self.verify_checksum(ctx, tv, &tarball_path)?;
+        Ok(())
+    }
+
+    async fn verify_provenance(
+        &self,
+        ctx: &InstallContext,
+        tv: &mut ToolVersion,
+        pkg: &AquaPackage,
+        v: &str,
+        filename: &str,
+    ) -> Result<()> {
         // Check if the lockfile expects provenance for this platform, then clear it
         // so we can detect whether verification actually re-set it
         let platform_key = self.get_platform_key();
@@ -1044,7 +1094,12 @@ impl AquaBackend {
                 .get(&platform_key)
                 .is_none_or(|pi| pi.checksum.is_none());
 
-            let needs_cosign = !skip_cosign;
+            let needs_cosign = !skip_cosign
+                && Settings::get().aqua.cosign
+                && checksum
+                    .cosign
+                    .as_ref()
+                    .is_some_and(|c| c.enabled != Some(false));
             // Short-circuit cosign if a higher-priority mechanism already recorded provenance.
             // Safe to cache: provenance is only modified by the single-threaded verification
             // methods above (attestations, slsa, minisign), all of which have completed by now.
@@ -1071,7 +1126,7 @@ impl AquaBackend {
                     .await?;
             }
 
-            if !skip_cosign && !cosign_already_verified && checksum_path.exists() {
+            if needs_cosign && !cosign_already_verified && checksum_path.exists() {
                 self.cosign_checksums(ctx, pkg, v, tv, &checksum_path, &download_path)
                     .await?;
             }
@@ -1106,9 +1161,28 @@ impl AquaBackend {
             }
         }
 
-        let tarball_path = tv.download_path().join(filename);
-        self.verify_checksum(ctx, tv, &tarball_path)?;
         Ok(())
+    }
+
+    /// When skipping full provenance re-verification (lockfile has checksum+provenance),
+    /// check that the setting for the recorded provenance type is still enabled.
+    /// Disabling a verification setting while the lockfile expects it is a downgrade.
+    fn ensure_provenance_setting_enabled(
+        &self,
+        tv: &ToolVersion,
+        platform_key: &str,
+    ) -> Result<()> {
+        super::ensure_provenance_setting_enabled(tv, platform_key, |provenance| {
+            let settings = Settings::get();
+            Ok(match provenance {
+                ProvenanceType::GithubAttestations => {
+                    !settings.github_attestations || !settings.aqua.github_attestations
+                }
+                ProvenanceType::Slsa { .. } => !settings.slsa || !settings.aqua.slsa,
+                ProvenanceType::Cosign => !settings.aqua.cosign,
+                ProvenanceType::Minisign => !settings.aqua.minisign,
+            })
+        })
     }
 
     async fn verify_minisign(
