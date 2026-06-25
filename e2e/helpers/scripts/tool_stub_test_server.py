@@ -5,6 +5,7 @@ Serves mock endpoints to avoid external network dependencies
 """
 
 import http.server
+import os
 import socketserver
 import sys
 import json
@@ -41,8 +42,7 @@ class ToolStubTestHandler(http.server.SimpleHTTPRequestHandler):
             })
             self.wfile.write(content.encode('utf-8'))
         else:
-            # Return 404 for other paths
-            self.send_error(404, "File not found")
+            super().do_GET()
 
     def log_message(self, format, *args):
         """Suppress log messages for cleaner test output"""
@@ -51,7 +51,13 @@ class ToolStubTestHandler(http.server.SimpleHTTPRequestHandler):
 def start_server(port):
     """Start the HTTP test server"""
     with socketserver.TCPServer(("127.0.0.1", port), ToolStubTestHandler) as httpd:
-        print(f"Tool stub test server running on port {port}", flush=True)
+        actual_port = httpd.server_address[1]
+        port_file = os.environ.get("MISE_TOOL_STUB_TEST_PORT_FILE")
+        if port_file:
+            port_file_path = Path(port_file)
+            port_file_path.parent.mkdir(parents=True, exist_ok=True)
+            port_file_path.write_text(str(actual_port))
+        print(f"Tool stub test server running on port {actual_port}", flush=True)
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:

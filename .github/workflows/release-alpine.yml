@@ -23,7 +23,7 @@ env:
 jobs:
   bump-alpine:
     runs-on: ubuntu-latest
-    container: ghcr.io/jdx/mise:alpine@sha256:4b8b28551840e8adce7561400adccfba020650376def40d8c8a90e9cd1c17afb
+    container: ghcr.io/jdx/mise:alpine@sha256:892c3241f890205079a0d583c00681ee8e92b1d0fc7ff39602d59670a8437b16
     timeout-minutes: 60
     if: |
       (github.event_name == 'release' && 
@@ -32,7 +32,7 @@ jobs:
       (github.event_name == 'workflow_dispatch')
     steps:
       - name: Checkout repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - name: Bump APKBUILD
         run: sudo -Eu packager ./scripts/release-alpine.sh
         env:

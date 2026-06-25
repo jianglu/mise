@@ -1,7 +1,7 @@
 use crate::config::config_file::mise_toml::EnvList;
 use crate::config::config_file::toml::deserialize_arr;
 use crate::task::task_sources::TaskOutputs;
-use crate::task::{RunEntry, Silent, Task, TaskDep};
+use crate::task::{RunEntry, Silent, Task, TaskConfirm, TaskDep, TaskToolValue};
 use indexmap::IndexMap;
 use serde::Deserialize;
 
@@ -14,7 +14,7 @@ pub struct TaskTemplate {
     #[serde(default, rename = "alias", deserialize_with = "deserialize_arr")]
     pub aliases: Vec<String>,
     #[serde(default)]
-    pub confirm: Option<String>,
+    pub confirm: Option<TaskConfirm>,
     #[serde(default, deserialize_with = "deserialize_arr")]
     pub depends: Vec<TaskDep>,
     #[serde(default, deserialize_with = "deserialize_arr")]
@@ -28,21 +28,15 @@ pub struct TaskTemplate {
     #[serde(default)]
     pub dir: Option<String>,
     #[serde(default)]
-    pub hide: Option<bool>,
-    #[serde(default)]
-    pub raw: Option<bool>,
-    #[serde(default)]
     pub sources: Vec<String>,
     #[serde(default)]
     pub outputs: TaskOutputs,
     #[serde(default)]
     pub shell: Option<String>,
     #[serde(default)]
-    pub quiet: Option<bool>,
-    #[serde(default)]
     pub silent: Option<Silent>,
     #[serde(default)]
-    pub tools: IndexMap<String, String>,
+    pub tools: IndexMap<String, TaskToolValue>,
     #[serde(default)]
     pub usage: String,
     #[serde(default)]
@@ -53,6 +47,33 @@ pub struct TaskTemplate {
     pub run_windows: Vec<RunEntry>,
     #[serde(default)]
     pub file: Option<String>,
+    /// Block reads, writes, network, and env vars
+    #[serde(default)]
+    pub deny_all: bool,
+    /// Block filesystem reads
+    #[serde(default)]
+    pub deny_read: bool,
+    /// Block all filesystem writes
+    #[serde(default)]
+    pub deny_write: bool,
+    /// Block all network access
+    #[serde(default)]
+    pub deny_net: bool,
+    /// Block env var inheritance
+    #[serde(default)]
+    pub deny_env: bool,
+    /// Allow reads from specific paths
+    #[serde(default)]
+    pub allow_read: Vec<std::path::PathBuf>,
+    /// Allow writes to specific paths
+    #[serde(default)]
+    pub allow_write: Vec<std::path::PathBuf>,
+    /// Allow network to specific hosts
+    #[serde(default)]
+    pub allow_net: Vec<String>,
+    /// Allow specific env vars through
+    #[serde(default)]
+    pub allow_env: Vec<String>,
 }
 
 impl Task {
@@ -146,11 +167,12 @@ impl Task {
             self.shell = template.shell.clone();
         }
 
-        // Note: quiet, hide, and raw are `bool` in Task (not Option<bool>), so we cannot
-        // distinguish between "not set" (defaults to false) and "explicitly set to false".
-        // Therefore, we do NOT merge these boolean fields from templates to avoid the case
-        // where a task explicitly sets `quiet = false` but gets overridden by a template's
-        // `quiet = true`. Users must explicitly set these in their task if needed.
+        // Note: quiet, hide, raw, interactive, and raw_args are `bool` in Task (not
+        // Option<bool>), so we cannot distinguish between "not set" (defaults to false)
+        // and "explicitly set to false". Therefore, we do NOT merge these boolean
+        // fields from templates to avoid the case where a task explicitly sets
+        // `quiet = false` but gets overridden by a template's `quiet = true`. Users
+        // must explicitly set these in their task if needed.
 
         // silent: use template only if local is Off (Silent is an enum, so we can distinguish)
         if matches!(self.silent, Silent::Off)
@@ -175,6 +197,19 @@ impl Task {
         {
             self.file = Some(file.into());
         }
+
+        // sandbox: restrictions compose with task-local settings, matching how
+        // task and global sandbox config are combined in the executor.
+        self.deny_all |= template.deny_all;
+        self.deny_read |= template.deny_read;
+        self.deny_write |= template.deny_write;
+        self.deny_net |= template.deny_net;
+        self.deny_env |= template.deny_env;
+
+        self.allow_read.splice(0..0, template.allow_read.clone());
+        self.allow_write.splice(0..0, template.allow_write.clone());
+        self.allow_net.splice(0..0, template.allow_net.clone());
+        self.allow_env.splice(0..0, template.allow_env.clone());
     }
 }
 
@@ -218,13 +253,16 @@ mod tests {
     #[test]
     fn test_merge_template_tools_deep_merge() {
         let mut task = Task {
-            tools: IndexMap::from([("node".to_string(), "20".to_string())]),
+            tools: IndexMap::from([("node".to_string(), TaskToolValue::String("20".to_string()))]),
             ..Default::default()
         };
         let template = TaskTemplate {
             tools: IndexMap::from([
-                ("python".to_string(), "3.12".to_string()),
-                ("node".to_string(), "18".to_string()), // Should be overridden by task
+                (
+                    "python".to_string(),
+                    TaskToolValue::String("3.12".to_string()),
+                ),
+                ("node".to_string(), TaskToolValue::String("18".to_string())), // Should be overridden by task
             ]),
             ..Default::default()
         };
@@ -233,8 +271,14 @@ mod tests {
 
         // Should have both tools, with task's node version
         assert_eq!(task.tools.len(), 2);
-        assert_eq!(task.tools.get("node"), Some(&"20".to_string()));
-        assert_eq!(task.tools.get("python"), Some(&"3.12".to_string()));
+        assert_eq!(
+            task.tools.get("node"),
+            Some(&TaskToolValue::String("20".to_string()))
+        );
+        assert_eq!(
+            task.tools.get("python"),
+            Some(&TaskToolValue::String("3.12".to_string()))
+        );
     }
 
     #[test]
@@ -352,5 +396,50 @@ mod tests {
             _ => None,
         });
         assert_eq!(shared_val, Some("task_value"));
+    }
+
+    #[test]
+    fn test_merge_template_sandbox_config() {
+        let mut task = Task {
+            deny_net: true,
+            allow_read: vec!["task-read".into()],
+            allow_env: vec!["TASK_*".to_string()],
+            ..Default::default()
+        };
+        let template = TaskTemplate {
+            deny_all: true,
+            deny_read: true,
+            deny_write: true,
+            deny_env: true,
+            allow_read: vec!["template-read".into()],
+            allow_write: vec!["template-write".into()],
+            allow_net: vec!["example.com".to_string()],
+            allow_env: vec!["TEMPLATE_*".to_string()],
+            ..Default::default()
+        };
+
+        task.merge_template(&template);
+
+        assert!(task.deny_all);
+        assert!(task.deny_read);
+        assert!(task.deny_write);
+        assert!(task.deny_net);
+        assert!(task.deny_env);
+        assert_eq!(
+            task.allow_read,
+            vec![
+                std::path::PathBuf::from("template-read"),
+                std::path::PathBuf::from("task-read")
+            ]
+        );
+        assert_eq!(
+            task.allow_write,
+            vec![std::path::PathBuf::from("template-write")]
+        );
+        assert_eq!(task.allow_net, vec!["example.com".to_string()]);
+        assert_eq!(
+            task.allow_env,
+            vec!["TEMPLATE_*".to_string(), "TASK_*".to_string()]
+        );
     }
 }

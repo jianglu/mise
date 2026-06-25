@@ -7,21 +7,23 @@ use std::time::Duration;
 use super::args::ToolArg;
 use crate::cli::{Cli, unescape_task_args};
 use crate::config::{Config, Settings};
+use crate::deps::{DepsEngine, DepsOptions};
 use crate::duration;
 use crate::env;
 use crate::file::display_path;
-use crate::prepare::{PrepareEngine, PrepareOptions};
 use crate::task::has_any_usage_spec;
 use crate::task::task_helpers::task_needs_permit;
 use crate::task::task_list::{get_task_lists, resolve_depends};
 use crate::task::task_output::TaskOutput;
 use crate::task::task_output_handler::OutputHandler;
 use crate::task::{Deps, Task};
-use crate::toolset::{InstallOptions, ToolsetBuilder};
+use crate::toolset::{InstallOptions, ResolveOptions, ToolsetBuilder};
 use crate::ui::{ctrlc, info, style};
 use clap::{CommandFactory, ValueHint};
 use eyre::{Result, bail, eyre};
+use futures_util::FutureExt;
 use itertools::Itertools;
+use std::panic::AssertUnwindSafe;
 use tokio::sync::Mutex;
 
 /// Run task(s)
@@ -134,39 +136,40 @@ pub struct Run {
     #[clap(skip)]
     pub is_linear: bool,
 
-    /// [experimental] Allow specific env var through (implies --deny-env for everything else)
+    /// Allow specific env var through (implies --deny-env for everything else)
+    /// Supports wildcards, e.g. --allow-env='MYAPP_*'
     #[clap(long, value_name = "VAR", verbatim_doc_comment)]
     pub allow_env: Vec<String>,
 
-    /// [experimental] Allow network to specific host (implies --deny-net for everything else)
+    /// Allow network to specific host (implies --deny-net for everything else)
     #[clap(long, value_name = "HOST", verbatim_doc_comment)]
     pub allow_net: Vec<String>,
 
-    /// [experimental] Allow reads from specific path (implies --deny-read for everything else)
+    /// Allow reads from specific path (implies --deny-read for everything else)
     #[clap(long, value_name = "PATH", verbatim_doc_comment)]
     pub allow_read: Vec<std::path::PathBuf>,
 
-    /// [experimental] Allow writes to specific path (implies --deny-write for everything else)
+    /// Allow writes to specific path (implies --deny-write for everything else)
     #[clap(long, value_name = "PATH", verbatim_doc_comment)]
     pub allow_write: Vec<std::path::PathBuf>,
 
-    /// [experimental] Block reads, writes, network, and env vars
+    /// Block reads, writes, network, and env vars
     #[clap(long, verbatim_doc_comment)]
     pub deny_all: bool,
 
-    /// [experimental] Block env var inheritance (only PATH, HOME, USER, SHELL, TERM, LANG pass through)
+    /// Block env var inheritance (only PATH, HOME, USER, SHELL, TERM, LANG pass through)
     #[clap(long, verbatim_doc_comment)]
     pub deny_env: bool,
 
-    /// [experimental] Block all network access
+    /// Block all network access
     #[clap(long, verbatim_doc_comment)]
     pub deny_net: bool,
 
-    /// [experimental] Block filesystem reads (system libs and tool dirs still accessible)
+    /// Block filesystem reads (system libs and tool dirs still accessible)
     #[clap(long, verbatim_doc_comment)]
     pub deny_read: bool,
 
-    /// [experimental] Block all filesystem writes
+    /// Block all filesystem writes
     #[clap(long, verbatim_doc_comment)]
     pub deny_write: bool,
 
@@ -180,7 +183,7 @@ pub struct Run {
 
     /// Skip automatic dependency preparation
     #[clap(long)]
-    pub no_prepare: bool,
+    pub no_deps: bool,
 
     /// Hides elapsed time after each task completes
     ///
@@ -237,13 +240,14 @@ impl Run {
 
         // Unescape task args early so we can check for help flags
         self.args = unescape_task_args(&self.args);
+        self.args_last = unescape_task_args(&self.args_last);
 
         // Temporarily unset cache key to force fresh env computation
         if self.fresh_env {
             env::reset_env_cache_key();
         }
 
-        // Check if --help or -h is in the task args BEFORE toolset/prepare
+        // Check if --help or -h is in the task args BEFORE toolset/deps
         // NOTE: Only check self.args, not self.args_last, because args_last contains
         // arguments after explicit -- which should always be passed through to the task
         let has_help_in_task_args =
@@ -251,7 +255,7 @@ impl Run {
 
         let mut config = Config::get().await?;
 
-        // Handle task help early to avoid unnecessary toolset/prepare work
+        // Handle task help early to avoid unnecessary toolset/deps work
         if has_help_in_task_args {
             // Build args list to get the task (filter out --help/-h for task lookup)
             let args = once(self.task.clone())
@@ -266,41 +270,27 @@ impl Run {
             let task_list = get_task_lists(&config, &args, false, false).await?;
 
             if let Some(task) = task_list.first() {
-                // Get usage spec to check if task has defined args/flags
-                let spec = task.parse_usage_spec_for_display(&config).await?;
+                // raw_args tasks act as proxies for tools that handle their
+                // own --help — fall through to normal execution so the flag
+                // reaches the underlying command instead of mise.
+                if !task.raw_args {
+                    // Get usage spec to check if task has defined args/flags
+                    let spec = task.parse_usage_spec_for_display(&config).await?;
 
-                if has_any_usage_spec(&spec) {
-                    // Task has usage spec defined, render help using usage library
-                    println!("{}", usage::docs::cli::render_help(&spec, &spec.cmd, true));
-                } else {
-                    // Task has no usage defined, show basic task info
-                    display_task_help(task)?;
+                    if has_any_usage_spec(&spec) {
+                        // Task has usage spec defined, render help using usage library
+                        println!("{}", usage::docs::cli::render_help(&spec, &spec.cmd, true));
+                    } else {
+                        // Task has no usage defined, show basic task info
+                        display_task_help(task)?;
+                    }
+                    return Ok(());
                 }
-                return Ok(());
             } else {
                 // No task found, show run command help
                 self.get_clap_command().print_long_help()?;
                 return Ok(());
             }
-        }
-
-        // Build and install toolset so tools like npm are available for prepare
-        let mut ts = ToolsetBuilder::new()
-            .with_args(&self.tool)
-            .with_default_to_latest(true)
-            .build(&config)
-            .await?;
-
-        let opts = InstallOptions {
-            jobs: self.jobs,
-            raw: self.raw,
-            missing_args_only: !Settings::get().task.run_auto_install,
-            skip_auto_install: !Settings::get().task.run_auto_install
-                || !Settings::get().auto_install,
-            ..Default::default()
-        };
-        if !self.skip_tools {
-            let _ = ts.install_missing_versions(&mut config, &opts).await?;
         }
 
         if !self.skip_deps {
@@ -318,35 +308,105 @@ impl Run {
 
         let mut task_list = get_task_lists(&config, &args, true, self.skip_deps).await?;
 
-        // Args after -- go directly to tasks (no prefix)
+        // Args after -- go directly to tasks (no prefix). They are also
+        // recorded on `trailing_args` so the task renderer can detect
+        // `-- --help` / `-- -h` and bypass the usage parser for them.
         if !self.args_last.is_empty() {
             for task in &mut task_list {
                 task.args.extend(self.args_last.clone());
+                task.trailing_args = self.args_last.clone();
+            }
+        }
+
+        // Fetch remote task files before parsing usage specs, so that
+        // file-based remote tasks have their files resolved to local cache.
+        let fetcher = crate::task::task_fetcher::TaskFetcher::new(self.no_cache);
+        fetcher.fetch_tasks(&mut task_list).await?;
+
+        // Re-render dependency templates with parent task's usage arg/flag values.
+        // This enables patterns like: depends = ["child {{usage.app}}"]
+        for task in &mut task_list {
+            let has_usage_deps = |raw: &Option<Vec<_>>| {
+                raw.as_ref()
+                    .is_some_and(|r| r.iter().any(crate::task::dep_has_usage_ref))
+            };
+            if has_usage_deps(&task.depends_raw)
+                || has_usage_deps(&task.depends_post_raw)
+                || has_usage_deps(&task.wait_for_raw)
+            {
+                let usage_values = crate::task::parse_usage_values_from_task(&config, task).await?;
+                if !usage_values.is_empty() {
+                    task.render_depends_with_usage(&config, &usage_values)
+                        .await?;
+                }
             }
         }
         time!("run get_task_lists");
 
         // Resolve transitive dependencies once upfront so we can:
-        // 1. Discover prepare providers from monorepo subdirectory configs
-        // 2. Reuse the resolved list for execution (avoiding duplicate work)
+        // 1. Discover deps providers from monorepo subdirectory configs
+        // 2. Include monorepo subdirectory tools in the toolset before installing
+        // 3. Reuse the resolved list for execution (avoiding duplicate work)
         let resolved_tasks = resolve_depends(&config, task_list).await?;
 
-        // Run auto-enabled prepare steps (unless --no-prepare)
-        if !self.no_prepare {
-            let env = ts.env_with_path(&config).await?;
-            let mut engine = PrepareEngine::new(&config)?;
+        // Collect subdirectory config files from all resolved tasks. In
+        // monorepos these come from sub mise.toml files referenced via the
+        // `//sub:taskname` syntax — they aren't in `config.config_files`.
+        let subdir_configs: Vec<_> = resolved_tasks
+            .iter()
+            .filter_map(|task| task.cf.clone())
+            .collect();
 
-            // Collect subdirectory config files from all resolved tasks
-            let subdir_configs: Vec<_> = resolved_tasks
-                .iter()
-                .filter_map(|task| task.cf.clone())
-                .collect();
+        // Build the toolset using root config files plus subdir configs from
+        // resolved tasks, so tools declared in monorepo subdirs are installed
+        // before deps (e.g. `[deps.bun] auto=true`) try to use them.
+        let mut combined_configs = config.config_files.clone();
+        for cf in &subdir_configs {
+            combined_configs
+                .entry(cf.get_path().to_path_buf())
+                .or_insert_with(|| cf.clone());
+        }
+
+        // Build and install toolset only after tasks resolve. A naked run that
+        // does not match any task should fail without installing project tools.
+        // Task startup should not fetch remote version metadata just to build
+        // the environment. If tools are missing and auto-install is enabled,
+        // install_missing_versions re-resolves those specific requests online.
+        let resolve_options = ResolveOptions {
+            offline: true,
+            ..Default::default()
+        };
+        let mut ts = ToolsetBuilder::new()
+            .with_args(&self.tool)
+            .with_default_to_latest(true)
+            .with_config_files(combined_configs)
+            .with_resolve_options(resolve_options)
+            .build(&config)
+            .await?;
+
+        let opts = InstallOptions {
+            jobs: self.jobs,
+            raw: self.raw,
+            missing_args_only: !Settings::get().task.run_auto_install,
+            skip_auto_install: !Settings::get().task.run_auto_install
+                || !Settings::get().auto_install,
+            ..Default::default()
+        };
+        if !self.skip_tools {
+            let _ = ts.install_missing_versions(&mut config, &opts).await?;
+        }
+
+        // Run auto-enabled deps steps (unless --no-deps)
+        if !self.no_deps {
+            let env = ts.env_with_path(&config).await?;
+            let mut engine = DepsEngine::new(&config)?;
+
             if !subdir_configs.is_empty() {
                 engine.add_config_files(subdir_configs);
             }
 
             engine
-                .run(PrepareOptions {
+                .run(DepsOptions {
                     auto_only: true, // Only run providers with auto=true
                     env,
                     ..Default::default()
@@ -509,15 +569,46 @@ impl Run {
         // always sees the parent in `executed` — avoiding a race where a
         // concurrent task fails between spawn and first poll.
         deps_for_remove.lock().await.mark_executed(&task);
+        let semaphore = ctx.semaphore.clone();
         ctx.jset.lock().await.spawn(async move {
-            let _permit = permit_opt;
-            let completed = deps_for_remove.lock().await.handled_task_keys();
-            let result = this
-                .run_task_sched(&task, &ctx.config, ctx.sched_tx.clone(), completed)
-                .await;
+            let mut permit = permit_opt;
+            let (completed, dep_ran) = {
+                let deps = deps_for_remove.lock().await;
+                (deps.handled_task_keys(), deps.any_dep_ran(&task))
+            };
+            let (result, panicked) = match AssertUnwindSafe(this.run_task_sched(
+                &task,
+                &ctx.config,
+                ctx.sched_tx.clone(),
+                completed,
+                dep_ran,
+                semaphore,
+                &mut permit,
+            ))
+            .catch_unwind()
+            .await
+            {
+                Ok(result) => (result, false),
+                Err(payload) => (
+                    Err(eyre!("task panicked: {}", panic_payload_message(&payload))),
+                    true,
+                ),
+            };
+            // If the task actually ran (not skipped) and has sources defined,
+            // mark it so dependents' source freshness checks are invalidated.
+            // Tasks without sources always run and should not trigger invalidation.
+            if let Ok(true) = &result
+                && !task.sources.is_empty()
+            {
+                deps_for_remove.lock().await.mark_ran(&task);
+            }
             if let Err(err) = &result {
-                let status = Error::get_exit_status(err);
-                if !this.is_stopping() && status.is_none() {
+                let status = if panicked {
+                    Some(1)
+                } else {
+                    Error::get_exit_status(err)
+                };
+                if !this.is_stopping() && (panicked || status.is_none()) {
                     let prefix = task.estyled_prefix();
                     if Settings::get().verbose {
                         this.eprint(&task, &prefix, &format!("{} {err:?}", style::ered("ERROR")));
@@ -531,6 +622,18 @@ impl Run {
                     };
                 }
                 this.add_failed_task(task.clone(), status);
+                // SIGTERM any still-running siblings so we exit promptly on
+                // failure instead of waiting for them to finish naturally.
+                // run_loop only sees `is_stopping` when it next iterates,
+                // which doesn't happen while it's awaiting an idle select —
+                // so the kill has to be triggered from here.
+                if !this.continue_on_error {
+                    debug!("task {} failed, killing siblings", task.name);
+                    #[cfg(unix)]
+                    crate::cmd::CmdLineRunner::kill_all(nix::sys::signal::SIGTERM);
+                    #[cfg(windows)]
+                    crate::cmd::CmdLineRunner::kill_all();
+                }
             }
             if let Some(oh) = &this.output_handler
                 && oh.output(None) == TaskOutput::KeepOrder
@@ -540,7 +643,7 @@ impl Run {
             deps_for_remove.lock().await.remove(&task);
             trace!("deps removed: {} {}", task.name, task.args.join(" "));
             in_flight_c.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            result
+            result.map(|_| ())
         });
 
         Ok(())
@@ -674,17 +777,29 @@ impl Run {
             .unwrap_or(false)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_task_sched(
         &self,
         task: &Task,
         config: &Arc<Config>,
         sched_tx: Arc<tokio::sync::mpsc::UnboundedSender<(Task, Arc<Mutex<Deps>>)>>,
         completed_tasks: std::collections::HashSet<crate::task::TaskKey>,
-    ) -> Result<()> {
+        dep_ran: bool,
+        semaphore: Arc<tokio::sync::Semaphore>,
+        permit: &mut Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<bool> {
         self.executor
             .as_ref()
             .expect("executor must be initialized before running tasks")
-            .run_task_sched(task, config, sched_tx, completed_tasks)
+            .run_task_sched(
+                task,
+                config,
+                sched_tx,
+                completed_tasks,
+                dep_ran,
+                semaphore,
+                permit,
+            )
             .await
     }
 
@@ -721,6 +836,16 @@ impl Run {
     }
 }
 
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "unknown panic payload"
+    }
+}
+
 fn display_task_help(task: &Task) -> Result<()> {
     let name = if task.display_name.is_empty() {
         &task.name
@@ -750,7 +875,7 @@ fn display_task_help(task: &Task) -> Result<()> {
         "To define arguments, add a `usage` field to the task definition in the config file."
     };
     miseprintln!("{hint}");
-    miseprintln!("See https://mise.jdx.dev/tasks/task-configuration.html for more information.");
+    miseprintln!("See https://mise.en.dev/tasks/task-configuration.html for more information.");
     Ok(())
 }
 
@@ -775,3 +900,26 @@ static AFTER_LONG_HELP: &str = color_print::cstr!(
     $ <bold>mise run cmd1 arg1 arg2 ::: cmd2 arg1 arg2</bold>
 "#
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_panic_payload_message_from_static_str() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("panic message");
+        assert_eq!(panic_payload_message(&*payload), "panic message");
+    }
+
+    #[test]
+    fn test_panic_payload_message_from_string() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("panic message"));
+        assert_eq!(panic_payload_message(&*payload), "panic message");
+    }
+
+    #[test]
+    fn test_panic_payload_message_from_unknown_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(123usize);
+        assert_eq!(panic_payload_message(&*payload), "unknown panic payload");
+    }
+}

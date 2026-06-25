@@ -1,6 +1,10 @@
-use crate::backend::VersionInfo;
 use crate::backend::backend_type::BackendType;
+use crate::backend::options::BackendOptions;
 use crate::backend::platform_target::PlatformTarget;
+use crate::backend::{
+    MISE_BINS_DIR, VersionInfo, filter_cached_prereleases, mark_prerelease,
+    runtime_path_for_install_path,
+};
 use crate::cli::args::BackendArg;
 use crate::config::Config;
 use crate::config::Settings;
@@ -8,11 +12,11 @@ use crate::http::HTTP;
 use crate::install_context::InstallContext;
 use crate::lockfile::{self, Lockfile, PlatformInfo};
 use crate::toolset::ToolSource;
-use crate::toolset::ToolVersion;
+use crate::toolset::{ToolVersion, ToolVersionOptions};
 use crate::{backend::Backend, dirs, parallel};
 use crate::{file, hash};
 use async_trait::async_trait;
-use eyre::Result;
+use eyre::{Result, WrapErr};
 use itertools::Itertools;
 use rattler::install::{InstallDriver, InstallOptions, PythonInfo, link_package};
 use rattler_conda_types::{
@@ -29,6 +33,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use versions::Versioning;
 
 /// Conda package info stored in the shared conda-packages section of lockfiles
@@ -39,24 +44,27 @@ pub struct CondaPackageInfo {
     pub checksum: Option<String>,
 }
 
-/// Conda backend requires experimental mode to be enabled
-pub const EXPERIMENTAL: bool = true;
-
 #[derive(Debug)]
 pub struct CondaBackend {
     ba: Arc<BackendArg>,
 }
 
-impl CondaBackend {
-    pub fn from_arg(ba: BackendArg) -> Self {
-        Self { ba: Arc::new(ba) }
+#[derive(Debug, Clone, Copy)]
+struct CondaOptions<'a> {
+    values: BackendOptions<'a>,
+}
+
+impl<'a> CondaOptions<'a> {
+    fn new(raw: &'a ToolVersionOptions) -> Self {
+        Self {
+            values: BackendOptions::new(raw),
+        }
     }
 
     fn channel_name(&self) -> String {
-        self.ba
-            .opts()
-            .get("channel")
-            .map(|s| s.to_string())
+        self.values
+            .str("channel")
+            .map(str::to_string)
             .unwrap_or_else(|| Settings::get().conda.channel.clone())
     }
 
@@ -66,6 +74,29 @@ impl CondaBackend {
         let config = ChannelConfig::default_with_root_dir(root_dir);
         Channel::from_str(&name, &config)
             .map_err(|e| eyre::eyre!("invalid conda channel '{}': {}", name, e))
+    }
+
+    fn lockfile_options(&self) -> BTreeMap<String, String> {
+        BTreeMap::from([("channel".to_string(), self.channel_name())])
+    }
+}
+
+impl CondaBackend {
+    fn next_temp_id() -> u64 {
+        static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn temp_download_path(dest: &std::path::Path) -> PathBuf {
+        dest.with_extension(format!(
+            "tmp.{}.{}",
+            std::process::id(),
+            Self::next_temp_id()
+        ))
+    }
+
+    pub fn from_arg(ba: BackendArg) -> Self {
+        Self { ba: Arc::new(ba) }
     }
 
     fn create_gateway() -> Gateway {
@@ -92,16 +123,26 @@ impl CondaBackend {
             .unwrap_or_default()
     }
 
-    /// Flatten gateway RepoData into owned records for the solver, deduplicating
-    /// by URL to avoid DuplicateRecords errors when the same package appears in
-    /// multiple subdir queries (e.g. platform + noarch).
-    fn flatten_repodata(repodata: &[RepoData]) -> Vec<RepoDataRecord> {
+    /// Deduplicate records that share the same archive identifier
+    /// (name-version-build plus archive type) — the same key rattler-solve uses
+    /// to detect duplicates, so URL-only dedup isn't sufficient when conda-forge
+    /// serves the same archive under multiple URLs (e.g. distinct CDN paths).
+    fn dedup_records_by_identifier<'a, I>(records: I) -> Vec<RepoDataRecord>
+    where
+        I: IntoIterator<Item = &'a RepoDataRecord>,
+    {
         let mut seen = HashSet::new();
-        repodata
-            .iter()
-            .flat_map(|rd| rd.iter().cloned())
-            .filter(|r| seen.insert(r.url.clone()))
+        records
+            .into_iter()
+            .filter(|r| seen.insert(&r.identifier))
+            .cloned()
             .collect()
+    }
+
+    /// Flatten gateway RepoData into owned records for the solver, deduplicating
+    /// by archive identifier. See [`Self::dedup_records_by_identifier`].
+    fn flatten_repodata(repodata: &[RepoData]) -> Vec<RepoDataRecord> {
+        Self::dedup_records_by_identifier(repodata.iter().flat_map(|rd| rd.iter()))
     }
 
     /// Fetch repodata and solve the conda environment for the given specs and platform.
@@ -109,8 +150,9 @@ impl CondaBackend {
         &self,
         specs: Vec<MatchSpec>,
         platform: CondaPlatform,
+        opts: CondaOptions<'_>,
     ) -> Result<Vec<RepoDataRecord>> {
-        let channel = self.channel()?;
+        let channel = opts.channel()?;
         let gateway = Self::create_gateway();
 
         let repodata: Vec<RepoData> = gateway
@@ -132,8 +174,9 @@ impl CondaBackend {
             timeout: None,
             channel_priority: ChannelPriority::Strict,
             exclude_newer: None,
-            min_age: None,
             strategy: SolveStrategy::Highest,
+            dependency_overrides: vec![],
+            cancellation_token: None,
         };
 
         let mut solver = ResolvoSolver;
@@ -199,7 +242,7 @@ impl CondaBackend {
         }
 
         file::create_dir_all(Self::conda_data_dir())?;
-        let temp = dest.with_extension(format!("tmp.{}", std::process::id()));
+        let temp = Self::temp_download_path(dest);
         HTTP.download_file(url, &temp, None).await?;
 
         if !Self::verify_checksum(&temp, checksum)? {
@@ -212,7 +255,22 @@ impl CondaBackend {
             ));
         }
 
-        file::rename(&temp, dest)?;
+        if let Err(err) = file::rename(&temp, dest) {
+            let _ = file::remove_all(&temp);
+
+            // Another concurrent installer may have won the race and written `dest`.
+            // If `dest` now exists and verifies, treat this as success.
+            if dest.exists() && Self::verify_checksum(dest, checksum)? {
+                return Ok(());
+            }
+
+            return Err(err).wrap_err_with(|| {
+                format!(
+                    "failed to finalize conda archive download for {}",
+                    dest.display()
+                )
+            });
+        }
         Ok(())
     }
 
@@ -330,8 +388,10 @@ impl CondaBackend {
             .map_err(|e| eyre::eyre!("invalid conda spec '{}': {}", spec_str, e))?;
 
         ctx.pr.set_message("fetching repodata".to_string());
+        let raw_opts = tv.request.options();
+        let opts = CondaOptions::new(&raw_opts);
         let records = self
-            .solve_packages(vec![match_spec], CondaPlatform::current())
+            .solve_packages(vec![match_spec], CondaPlatform::current(), opts)
             .await?;
 
         // Separate main package from deps
@@ -511,7 +571,7 @@ impl CondaBackend {
     /// Uses the PathsEntry list returned by rattler's link_package to identify which files
     /// belong to the main package (excluding transitive dependency binaries).
     fn create_symlink_bin_dir(&self, tv: &ToolVersion, main_paths: &[PathsEntry]) -> Result<()> {
-        let symlink_dir = tv.install_path().join(".mise-bins");
+        let symlink_dir = tv.install_path().join(MISE_BINS_DIR);
         file::create_dir_all(&symlink_dir)?;
 
         let install_path = tv.install_path();
@@ -557,7 +617,11 @@ impl CondaBackend {
         let match_spec = MatchSpec::from_str(&spec_str, ParseStrictness::Lenient)
             .map_err(|e| eyre::eyre!("invalid conda spec '{}': {}", spec_str, e))?;
 
-        let records = self.solve_packages(vec![match_spec], platform).await?;
+        let raw_opts = tv.request.options();
+        let opts = CondaOptions::new(&raw_opts);
+        let records = self
+            .solve_packages(vec![match_spec], platform, opts)
+            .await?;
 
         let tool_name_norm = tool_name.to_lowercase();
         let mut result = BTreeMap::new();
@@ -589,8 +653,23 @@ impl Backend for CondaBackend {
         &self.ba
     }
 
-    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<VersionInfo>> {
-        let channel = self.channel()?;
+    fn remote_version_listing_tool_option_keys(&self) -> &'static [&'static str] {
+        &["channel"]
+    }
+
+    fn resolve_lockfile_options(
+        &self,
+        request: &crate::toolset::ToolRequest,
+        _target: &PlatformTarget,
+    ) -> Result<BTreeMap<String, String>> {
+        let raw_opts = request.options();
+        Ok(CondaOptions::new(&raw_opts).lockfile_options())
+    }
+
+    async fn _list_remote_versions(&self, config: &Arc<Config>) -> Result<Vec<VersionInfo>> {
+        let raw_opts = config.get_tool_opts_with_overrides(&self.ba).await?;
+        let opts = CondaOptions::new(&raw_opts);
+        let channel = opts.channel()?;
         let current_platform = CondaPlatform::current();
         let tool_name = self.tool_name();
 
@@ -628,12 +707,24 @@ impl Backend for CondaBackend {
     }
 
     /// Override to bypass the shared remote_versions cache since conda's
-    /// channel option affects which versions are available.
-    async fn list_remote_versions_with_info(
+    /// channel option affects which versions are available. The override is
+    /// on `_with_refresh` so it applies to both cached and refresh-enabled
+    /// resolution paths; conda always queries the channel directly so the
+    /// `_refresh` flag is irrelevant.
+    async fn list_remote_versions_with_info_with_refresh(
         &self,
         config: &Arc<Config>,
+        _refresh: bool,
     ) -> Result<Vec<VersionInfo>> {
-        self._list_remote_versions(config).await
+        let opts = config.get_tool_opts_with_overrides(&self.ba).await?;
+        let want_prereleases = self.include_prereleases(&opts);
+        let versions = self
+            ._list_remote_versions(config)
+            .await?
+            .into_iter()
+            .map(mark_prerelease)
+            .collect();
+        Ok(filter_cached_prereleases(versions, want_prereleases))
     }
 
     async fn install_version_(
@@ -641,8 +732,6 @@ impl Backend for CondaBackend {
         ctx: &InstallContext,
         mut tv: ToolVersion,
     ) -> Result<ToolVersion> {
-        Settings::get().ensure_experimental("conda backend")?;
-
         let platform_key = self.get_platform_key();
         let has_locked = tv
             .lock_platforms
@@ -677,7 +766,9 @@ impl Backend for CondaBackend {
             }
         };
 
-        let records = match self.solve_packages(vec![match_spec], platform).await {
+        let raw_opts = tv.request.options();
+        let opts = CondaOptions::new(&raw_opts);
+        let records = match self.solve_packages(vec![match_spec], platform, opts).await {
             Ok(r) => r,
             Err(e) => {
                 debug!(
@@ -720,22 +811,154 @@ impl Backend for CondaBackend {
         _config: &Arc<Config>,
         tv: &ToolVersion,
     ) -> Result<Vec<PathBuf>> {
-        let mise_bins = tv.install_path().join(".mise-bins");
+        let install_path = tv.install_path();
+        let mise_bins = install_path.join(MISE_BINS_DIR);
         if mise_bins.exists() {
-            return Ok(vec![mise_bins]);
+            return Ok(vec![runtime_path_for_install_path(tv, mise_bins)]);
         }
 
         // Fallback for tools installed before this change
-        let install_path = tv.install_path();
-        if cfg!(windows) {
+        let bin_paths = if cfg!(windows) {
             // Conda packages on Windows can put binaries in either location
             // depending on the build variant (MSVC vs MSYS2/MinGW)
-            Ok(vec![
+            vec![
                 install_path.join("Library").join("bin"),
                 install_path.join("bin"),
-            ])
+            ]
         } else {
-            Ok(vec![install_path.join("bin")])
+            vec![install_path.join("bin")]
+        };
+
+        Ok(bin_paths
+            .into_iter()
+            .map(|path| runtime_path_for_install_path(tv, path))
+            .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CondaBackend, CondaOptions};
+    use crate::toolset::ToolVersionOptions;
+    use rattler_conda_types::package::{ArchiveIdentifier, CondaArchiveType, DistArchiveType};
+    use rattler_conda_types::{
+        PackageName, PackageRecord, RepoDataRecord, Version, package::DistArchiveIdentifier,
+    };
+    use std::collections::BTreeMap;
+    use std::str::FromStr;
+    use url::Url;
+
+    fn make_record(name: &str, version: &str, build: &str, url: &str) -> RepoDataRecord {
+        let archive_id = ArchiveIdentifier {
+            name: name.to_string(),
+            version: version.to_string(),
+            build_string: build.to_string(),
+        };
+        let conda_type = if url.ends_with(".conda") {
+            CondaArchiveType::Conda
+        } else {
+            CondaArchiveType::TarBz2
+        };
+        RepoDataRecord {
+            package_record: PackageRecord::new(
+                PackageName::from_str(name).unwrap(),
+                Version::from_str(version).unwrap(),
+                build.to_string(),
+            ),
+            identifier: DistArchiveIdentifier::new(archive_id, DistArchiveType::Conda(conda_type)),
+            url: Url::parse(url).unwrap(),
+            channel: None,
         }
+    }
+
+    #[test]
+    fn conda_options_reads_channel() {
+        let mut opts = ToolVersionOptions::default();
+        opts.opts.insert(
+            "channel".to_string(),
+            toml::Value::String("conda-forge".to_string()),
+        );
+
+        assert_eq!(CondaOptions::new(&opts).channel_name(), "conda-forge");
+    }
+
+    #[test]
+    fn conda_lockfile_options_include_channel() {
+        let mut opts = ToolVersionOptions::default();
+        opts.opts.insert(
+            "channel".to_string(),
+            toml::Value::String("bioconda".to_string()),
+        );
+
+        assert_eq!(
+            CondaOptions::new(&opts).lockfile_options(),
+            BTreeMap::from([("channel".to_string(), "bioconda".to_string())])
+        );
+    }
+
+    #[test]
+    fn temp_download_path_is_unique_per_call() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let dest = tmpdir.path().join("libgcc-15.2.0-he0feb66_18.conda");
+
+        let first = CondaBackend::temp_download_path(&dest);
+        let second = CondaBackend::temp_download_path(&dest);
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), dest.parent());
+        assert_eq!(second.parent(), dest.parent());
+    }
+
+    /// Regression test for https://github.com/jdx/mise/discussions/9829:
+    /// conda-forge can serve the same archive under multiple URLs, so URL-based
+    /// dedup leaves duplicates that the solver rejects. Dedup must use the
+    /// archive identifier (name-version-build + archive type).
+    #[test]
+    fn dedup_records_collapses_same_identifier_different_urls() {
+        let records = [
+            make_record(
+                "adwaita-icon-theme",
+                "40.1.1",
+                "ha770c72_1",
+                "https://conda.anaconda.org/conda-forge/noarch/adwaita-icon-theme-40.1.1-ha770c72_1.tar.bz2",
+            ),
+            make_record(
+                "adwaita-icon-theme",
+                "40.1.1",
+                "ha770c72_1",
+                "https://mirror.example.com/conda-forge/noarch/adwaita-icon-theme-40.1.1-ha770c72_1.tar.bz2",
+            ),
+        ];
+
+        let deduped = CondaBackend::dedup_records_by_identifier(records.iter());
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(
+            deduped[0].identifier.to_string(),
+            "adwaita-icon-theme-40.1.1-ha770c72_1.tar.bz2"
+        );
+    }
+
+    /// .conda and .tar.bz2 variants of the same name-version-build are distinct
+    /// archives (the solver prefers .conda); dedup must preserve both so the
+    /// solver's archive-type preference logic still applies.
+    #[test]
+    fn dedup_records_preserves_conda_and_tarbz2_variants() {
+        let records = [
+            make_record(
+                "foo",
+                "1.0",
+                "h0_0",
+                "https://example.com/foo-1.0-h0_0.tar.bz2",
+            ),
+            make_record(
+                "foo",
+                "1.0",
+                "h0_0",
+                "https://example.com/foo-1.0-h0_0.conda",
+            ),
+        ];
+
+        let deduped = CondaBackend::dedup_records_by_identifier(records.iter());
+        assert_eq!(deduped.len(), 2);
     }
 }

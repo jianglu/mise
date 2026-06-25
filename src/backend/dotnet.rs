@@ -2,20 +2,38 @@ use std::sync::Arc;
 
 use crate::backend::VersionInfo;
 use crate::backend::backend_type::BackendType;
+use crate::backend::options::BackendOptions;
 use crate::cli::args::BackendArg;
 use crate::cmd::CmdLineRunner;
 use crate::config::Settings;
 use crate::http::HTTP_FETCH;
+use crate::toolset::ToolVersionOptions;
 use crate::{backend::Backend, config::Config};
 use async_trait::async_trait;
 use eyre::eyre;
 
-/// Dotnet backend requires experimental mode to be enabled
-pub const EXPERIMENTAL: bool = true;
+pub const EXPERIMENTAL: bool = false;
 
 #[derive(Debug)]
 pub struct DotnetBackend {
     ba: Arc<BackendArg>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DotnetOptions<'a> {
+    values: BackendOptions<'a>,
+}
+
+impl<'a> DotnetOptions<'a> {
+    fn new(raw: &'a ToolVersionOptions) -> Self {
+        Self {
+            values: BackendOptions::new(raw),
+        }
+    }
+
+    fn prerelease(&self) -> bool {
+        self.values.bool("prerelease")
+    }
 }
 
 #[async_trait]
@@ -32,18 +50,23 @@ impl Backend for DotnetBackend {
         Ok(vec!["dotnet"])
     }
 
+    fn mark_prereleases_from_version_pattern(&self) -> bool {
+        true
+    }
+
     async fn _list_remote_versions(&self, _config: &Arc<Config>) -> eyre::Result<Vec<VersionInfo>> {
         let feed_url = self.get_search_url().await?;
 
         let feed: NugetFeedSearch = HTTP_FETCH
             .json(format!(
-                "{}?q={}&packageType=dotnettool&take=1&prerelease={}",
+                // semVerLevel=2.0.0 matches the official dotnet CLI: without it NuGet's
+                // search API hides packages whose versions are all SemVer 2.0.0 (e.g.
+                // roslyn-language-server), and omits SemVer2 versions from the returned
+                // version arrays of packages that are visible.
+                "{}?q={}&packageType=dotnettool&take=1&prerelease={}&semVerLevel=2.0.0",
                 feed_url,
                 &self.tool_name(),
-                Settings::get()
-                    .dotnet
-                    .package_flags
-                    .contains(&"prerelease".to_string())
+                true
             ))
             .await?;
 
@@ -73,12 +96,11 @@ impl Backend for DotnetBackend {
         ctx: &crate::install_context::InstallContext,
         tv: crate::toolset::ToolVersion,
     ) -> eyre::Result<crate::toolset::ToolVersion> {
-        Settings::get().ensure_experimental("dotnet backend")?;
-
         // Check if dotnet is available
         self.warn_if_dependency_missing(
             &ctx.config,
             "dotnet",
+            &["dotnet"],
             "To use dotnet tools with mise, you need to install .NET SDK first:\n\
               mise use dotnet@latest\n\n\
             Or install .NET SDK via https://dotnet.microsoft.com/download",
@@ -98,9 +120,18 @@ impl Backend for DotnetBackend {
 
         cli.with_pr(ctx.pr.as_ref())
             .envs(self.dependency_env(&ctx.config).await?)
+            .envs(tv.install_env())
             .execute()?;
 
         Ok(tv)
+    }
+
+    fn include_prereleases(&self, opts: &ToolVersionOptions) -> bool {
+        if Settings::get().prereleases {
+            return true;
+        }
+
+        DotnetOptions::new(opts).prerelease() || dotnet_legacy_prerelease_package_flag_enabled()
     }
 }
 
@@ -129,6 +160,23 @@ impl DotnetBackend {
 
         Ok(feed.id.clone())
     }
+}
+
+fn dotnet_legacy_prerelease_package_flag_enabled() -> bool {
+    let enabled = Settings::get()
+        .dotnet
+        .package_flags
+        .iter()
+        .any(|flag| flag == "prerelease");
+    if enabled {
+        deprecated_at!(
+            "2026.11.0",
+            "2027.11.0",
+            "setting.dotnet.package_flags.prerelease",
+            "`dotnet.package_flags = [\"prerelease\"]` is deprecated. Use the `prerelease = true` tool option instead."
+        );
+    }
+    enabled
 }
 
 #[derive(serde::Deserialize)]
@@ -160,4 +208,48 @@ struct NugetFeedSearchData {
 #[derive(serde::Deserialize)]
 struct NugetFeedSearchDataVersion {
     version: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts_with_prerelease(value: toml::Value) -> ToolVersionOptions {
+        let mut opts = ToolVersionOptions::default();
+        opts.opts.insert("prerelease".to_string(), value);
+        opts
+    }
+
+    #[test]
+    fn dotnet_options_reads_prerelease() {
+        assert!(!DotnetOptions::new(&ToolVersionOptions::default()).prerelease());
+        assert!(DotnetOptions::new(&opts_with_prerelease(toml::Value::Boolean(true))).prerelease());
+        assert!(
+            !DotnetOptions::new(&opts_with_prerelease(toml::Value::Boolean(false))).prerelease()
+        );
+        assert!(
+            DotnetOptions::new(&opts_with_prerelease(toml::Value::String(
+                "true".to_string()
+            )))
+            .prerelease()
+        );
+        assert!(
+            !DotnetOptions::new(&opts_with_prerelease(toml::Value::String(
+                "FALSE".to_string()
+            )))
+            .prerelease()
+        );
+        assert!(
+            DotnetOptions::new(&opts_with_prerelease(toml::Value::String("1".to_string())))
+                .prerelease()
+        );
+        assert!(
+            !DotnetOptions::new(&opts_with_prerelease(toml::Value::String("0".to_string())))
+                .prerelease()
+        );
+        assert!(
+            !DotnetOptions::new(&opts_with_prerelease(toml::Value::String("00".to_string())))
+                .prerelease()
+        );
+    }
 }

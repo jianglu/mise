@@ -1,17 +1,17 @@
 use std::path::{Path, PathBuf};
 use std::{collections::BTreeMap, sync::Arc};
 
-use crate::backend::Backend;
 use crate::backend::VersionInfo;
+use crate::backend::options::BackendOptions;
+use crate::backend::{Backend, IdiomaticVersion, platform_target::PlatformTarget};
 use crate::build_time::TARGET;
 use crate::cli::args::BackendArg;
 use crate::cmd::CmdLineRunner;
 use crate::config::{Config, Settings};
 use crate::http::HTTP;
 use crate::install_context::InstallContext;
-use crate::toolset::ToolSource::IdiomaticVersionFile;
 use crate::toolset::outdated_info::OutdatedInfo;
-use crate::toolset::{ResolveOptions, ToolVersion, Toolset};
+use crate::toolset::{ResolveOptions, ToolRequest, ToolVersion, ToolVersionOptions, Toolset};
 use crate::ui::progress_report::SingleReport;
 use crate::{dirs, env, file, github, plugins};
 use async_trait::async_trait;
@@ -21,6 +21,78 @@ use xx::regex;
 #[derive(Debug)]
 pub struct RustPlugin {
     ba: Arc<BackendArg>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RustOptions<'a> {
+    values: BackendOptions<'a>,
+}
+
+impl<'a> RustOptions<'a> {
+    fn new(raw: &'a ToolVersionOptions) -> Self {
+        Self {
+            values: BackendOptions::new(raw),
+        }
+    }
+
+    fn profile(&self) -> Option<&'a str> {
+        self.values.str("profile")
+    }
+
+    fn comma_list(&self, name: &str) -> Option<Vec<String>> {
+        match self.values.raw().opts.get(name) {
+            Some(toml::Value::String(value)) => Some(
+                value
+                    .split(',')
+                    .map(|value| value.trim().to_string())
+                    .collect(),
+            ),
+            Some(toml::Value::Array(values)) => Some(
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(|value| value.trim().to_string()))
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    fn install_args(&self) -> (Option<String>, Option<Vec<String>>, Option<Vec<String>>) {
+        let profile = self.profile().map(str::to_string);
+        let components = self.comma_list("components");
+        let targets = self.comma_list("targets");
+
+        (profile, components, targets)
+    }
+
+    fn lockfile_options(&self) -> BTreeMap<String, String> {
+        let (profile, components, targets) = self.install_args();
+        let mut opts = BTreeMap::new();
+
+        if let Some(profile) = profile
+            && !profile.is_empty()
+        {
+            opts.insert("profile".into(), profile);
+        }
+        if let Some(components) = components
+            && !components.is_empty()
+        {
+            let mut components = components;
+            components.sort();
+            components.dedup();
+            opts.insert("components".into(), components.join(","));
+        }
+        if let Some(targets) = targets
+            && !targets.is_empty()
+        {
+            let mut targets = targets;
+            targets.sort();
+            targets.dedup();
+            opts.insert("targets".into(), targets.join(","));
+        }
+
+        opts
+    }
 }
 
 impl RustPlugin {
@@ -47,6 +119,7 @@ impl RustPlugin {
             .arg("--default-toolchain")
             .arg("none")
             .arg("-y")
+            .envs(tv.install_env())
             .envs(self.exec_env(&ctx.config, ts, tv).await?);
         if let Some(host) = settings.rust.default_host.as_ref() {
             cmd = cmd.arg("--default-host").arg(host);
@@ -61,6 +134,7 @@ impl RustPlugin {
         CmdLineRunner::new(RUSTC_BIN)
             .with_pr(ctx.pr.as_ref())
             .arg("-V")
+            .envs(tv.install_env())
             .envs(self.exec_env(&ctx.config, ts, tv).await?)
             .prepend_path(self.list_bin_paths(&ctx.config, tv).await?)?
             .execute()
@@ -81,6 +155,15 @@ impl Backend for RustPlugin {
     /// Lockfile URLs are not applicable since we don't download artifacts directly.
     fn supports_lockfile_url(&self) -> bool {
         false
+    }
+
+    fn resolve_lockfile_options(
+        &self,
+        request: &ToolRequest,
+        _target: &PlatformTarget,
+    ) -> Result<BTreeMap<String, String>> {
+        let raw_opts = request.options();
+        Ok(RustOptions::new(&raw_opts).lockfile_options())
     }
 
     async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<VersionInfo>> {
@@ -121,18 +204,35 @@ impl Backend for RustPlugin {
     }
 
     async fn _parse_idiomatic_file(&self, path: &Path) -> Result<Vec<String>> {
+        Ok(self
+            ._parse_idiomatic_file_with_options(path)
+            .await?
+            .into_iter()
+            .map(|(version, _)| version)
+            .collect())
+    }
+
+    async fn _parse_idiomatic_file_with_options(
+        &self,
+        path: &Path,
+    ) -> Result<Vec<IdiomaticVersion>> {
         let rt = parse_idiomatic_file(path)?;
         if rt.channel.is_empty() {
             return Ok(vec![]);
         }
-        Ok(vec![rt.channel])
+        let options = rt.apply_to_options(ToolVersionOptions::default());
+        Ok(vec![(
+            rt.channel.clone(),
+            (!options.is_empty()).then_some(options),
+        )])
     }
 
     async fn install_version_(&self, ctx: &InstallContext, tv: ToolVersion) -> Result<ToolVersion> {
         self.setup_rustup(ctx, &tv).await?;
         let ts = ctx.config.get_toolset().await?;
 
-        let (profile, components, targets) = get_args(&tv);
+        let raw_opts = tv.request.options();
+        let (profile, components, targets) = RustOptions::new(&raw_opts).install_args();
 
         let mut cmd = CmdLineRunner::new(RUSTUP_BIN)
             .with_pr(ctx.pr.as_ref())
@@ -142,6 +242,7 @@ impl Backend for RustPlugin {
             .opt_args("--component", components)
             .opt_args("--target", targets)
             .prepend_path(self.list_bin_paths(&ctx.config, &tv).await?)?
+            .envs(tv.install_env())
             .envs(self.exec_env(&ctx.config, ts, &tv).await?);
         if let Some(profile) = profile.as_ref() {
             cmd = cmd.arg("--profile").arg(profile);
@@ -258,36 +359,31 @@ struct RustToolchain {
     targets: Option<Vec<String>>,
 }
 
-fn get_args(tv: &ToolVersion) -> (Option<String>, Option<Vec<String>>, Option<Vec<String>>) {
-    let rt = if tv.request.source().is_idiomatic_version_file() {
-        match tv.request.source() {
-            IdiomaticVersionFile(path) => parse_idiomatic_file(path).ok(),
-            _ => None,
+impl RustToolchain {
+    fn apply_to_options(&self, options: ToolVersionOptions) -> ToolVersionOptions {
+        let mut opts = options;
+        if let Some(profile) = &self.profile {
+            opts.opts
+                .insert("profile".into(), toml::Value::String(profile.clone()));
         }
-    } else {
-        None
-    };
+        if let Some(components) = &self.components {
+            opts.opts
+                .insert("components".into(), string_array(components));
+        }
+        if let Some(targets) = &self.targets {
+            opts.opts.insert("targets".into(), string_array(targets));
+        }
+        opts
+    }
+}
 
-    let get_tooloption = |name: &str| {
-        tv.request
-            .options()
-            .get(name)
-            .map(|c| c.split(',').map(|s| s.to_string()).collect())
-    };
-    let profile = rt
-        .as_ref()
-        .and_then(|rt| rt.profile.clone())
-        .or_else(|| tv.request.options().get("profile").map(|s| s.to_string()));
-    let components = rt
-        .as_ref()
-        .and_then(|rt| rt.components.clone())
-        .or_else(|| get_tooloption("components"));
-    let targets = rt
-        .as_ref()
-        .and_then(|rt| rt.targets.clone())
-        .or_else(|| get_tooloption("targets"));
-
-    (profile, components, targets)
+fn string_array(values: &[String]) -> toml::Value {
+    toml::Value::Array(
+        values
+            .iter()
+            .map(|value| toml::Value::String(value.clone()))
+            .collect(),
+    )
 }
 
 fn parse_idiomatic_file(path: &Path) -> Result<RustToolchain> {
@@ -407,4 +503,131 @@ fn cargo_bin() -> PathBuf {
 }
 fn cargo_bindir() -> PathBuf {
     cargo_home().join("bin")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts_with(key: &str, value: &str) -> ToolVersionOptions {
+        let mut opts = ToolVersionOptions::default();
+        opts.opts
+            .insert(key.to_string(), toml::Value::String(value.to_string()));
+        opts
+    }
+
+    #[test]
+    fn rust_options_reads_install_args() {
+        let mut opts = opts_with("profile", "minimal");
+        opts.opts.insert(
+            "components".to_string(),
+            toml::Value::String("clippy, rustfmt".to_string()),
+        );
+        opts.opts.insert(
+            "targets".to_string(),
+            toml::Value::String("wasm32-wasip1".to_string()),
+        );
+
+        let (profile, components, targets) = RustOptions::new(&opts).install_args();
+
+        assert_eq!(profile, Some("minimal".to_string()));
+        assert_eq!(
+            components,
+            Some(vec!["clippy".to_string(), "rustfmt".to_string()])
+        );
+        assert_eq!(targets, Some(vec!["wasm32-wasip1".to_string()]));
+    }
+
+    #[test]
+    fn rust_idiomatic_options_override_tool_options() {
+        let opts = opts_with("profile", "minimal");
+        let rt = RustToolchain {
+            profile: Some("default".to_string()),
+            ..Default::default()
+        };
+        let opts = rt.apply_to_options(opts);
+
+        let (profile, _, _) = RustOptions::new(&opts).install_args();
+
+        assert_eq!(profile, Some("default".to_string()));
+    }
+
+    #[tokio::test]
+    async fn rust_idiomatic_options_are_tool_options() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("rust-toolchain.toml");
+        std::fs::write(
+            &path,
+            r#"
+[toolchain]
+channel = "1.85.0"
+profile = "minimal"
+components = [" rustfmt ", "clippy", "clippy"]
+targets = ["wasm32-wasip1", " wasm32-wasip1 "]
+"#,
+        )?;
+
+        let plugin = RustPlugin::new();
+        let versions = plugin.parse_idiomatic_file_with_options(&path).await?;
+        let (version, options) = versions.into_iter().next().unwrap();
+
+        assert_eq!(version, "1.85.0");
+        assert_eq!(
+            RustOptions::new(&options).lockfile_options(),
+            BTreeMap::from([
+                ("components".to_string(), "clippy,rustfmt".to_string()),
+                ("profile".to_string(), "minimal".to_string()),
+                ("targets".to_string(), "wasm32-wasip1".to_string()),
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rust_lockfile_options_include_install_args() {
+        let mut opts = opts_with("profile", "minimal");
+        opts.opts.insert(
+            "components".to_string(),
+            toml::Value::String("clippy, rustfmt".to_string()),
+        );
+        opts.opts.insert(
+            "targets".to_string(),
+            toml::Value::String("wasm32-wasip1".to_string()),
+        );
+
+        assert_eq!(
+            RustOptions::new(&opts).lockfile_options(),
+            BTreeMap::from([
+                ("components".to_string(), "clippy,rustfmt".to_string()),
+                ("profile".to_string(), "minimal".to_string()),
+                ("targets".to_string(), "wasm32-wasip1".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn rust_idiomatic_options_override_inline_options() {
+        let opts = opts_with("profile", "minimal");
+        let rt = RustToolchain {
+            profile: Some("default".to_string()),
+            components: Some(vec!["rustfmt".to_string()]),
+            ..Default::default()
+        };
+        let opts = rt.apply_to_options(opts);
+
+        assert_eq!(
+            RustOptions::new(&opts).lockfile_options(),
+            BTreeMap::from([
+                ("components".to_string(), "rustfmt".to_string()),
+                ("profile".to_string(), "default".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn rust_lockfile_options_skip_empty_profile() {
+        let opts = opts_with("profile", "");
+
+        assert_eq!(RustOptions::new(&opts).lockfile_options(), BTreeMap::new());
+    }
 }

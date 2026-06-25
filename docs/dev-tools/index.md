@@ -1,8 +1,7 @@
 # Dev Tools
 
-> _Like [asdf](https://asdf-vm.com) (or [nvm](https://github.com/nvm-sh/nvm)
-> or [pyenv](https://github.com/pyenv/pyenv) but for any language), it manages dev tools like node,
-> python, cmake, terraform, and [hundreds more](/registry.html)._
+> _Install and switch between dev tools like node, python, cmake, terraform,
+> and [hundreds more](/registry.html), all from the same project config._
 
 `mise` is a tool that manages installations of programming language runtimes and other tools for local development. For example, it can be used to manage multiple versions of Node.js, Python, Ruby, Go, etc. on the same machine.
 
@@ -13,7 +12,7 @@ To know which tool version to use, mise will typically look for a `mise.toml` fi
 
 ```toml [mise.toml]
 [tools]
-node = '22'
+node = '24'
 python = '3'
 ruby = 'latest'
 ```
@@ -27,9 +26,9 @@ including values produced by env directives like `_.source`, `_.file`, or env mo
 before tool version templates are rendered.
 
 ::: info
-mise is inspired by [asdf](https://asdf-vm.com) and can leverage asdf's
-vast [plugin ecosystem](https://github.com/mise-plugins/registry)
-under the hood. However, [it is _much_ faster than asdf and has a more friendly user experience](./comparison-to-asdf).
+mise is compatible with asdf `.tool-versions` files and can still use asdf
+plugins when needed. If you're migrating from asdf, see the
+[comparison guide](./comparison-to-asdf).
 :::
 
 ## How it works
@@ -165,7 +164,7 @@ Behavior:
 
 - The command runs once the install completes successfully for that tool/version.
 - The tool's bin path is on PATH during the command, so you can invoke the installed tool directly.
-- Environment variables include `MISE_TOOL_INSTALL_PATH` pointing to the tool's install directory.
+- Environment variables include `MISE_TOOL_INSTALL_PATH` pointing to the tool's install directory and any variables from that tool's `install_env` option.
 - If the install fails, the `postinstall` command is not run.
 
 ## OS-Specific Tools
@@ -184,17 +183,78 @@ ripgrep = { version = "latest", os = ["linux", "macos"] }
 "cargo:usage-cli" = {
     version = "latest",
     os = ["linux", "macos"],
-    install_env = { RUST_BACKTRACE = "1" }
+    locked = false
 }
 ```
 
 The `os` field accepts an array of operating system identifiers:
 
 - `"linux"` - All Linux distributions
-- `"macos"` - macOS (Darwin)
-- `"windows"` - Windows
+- `"macos"` - macOS (Darwin). `"darwin"` is also accepted as an alias.
+- `"windows"` - Windows. `"win"` is also accepted as an alias.
+
+### OS/Architecture Combinations
+
+You can also restrict tools to specific OS and architecture combinations using the `os/arch` syntax:
+
+```toml
+[tools]
+# Only install on macOS ARM64 and all Linux (skips macOS x86_64)
+hk = { version = "latest", os = ["linux", "macos/arm64"] }
+
+# Only install on Linux x86_64
+mytool = { version = "latest", os = ["linux/x64"] }
+```
+
+Supported architecture identifiers:
+
+- `"arm64"` (or `"aarch64"`)
+- `"x64"` (or `"x86_64"` or `"amd64"`)
+
+When an entry contains `/`, both the OS and architecture must match. When an entry is just an OS name, it matches any architecture on that OS.
 
 If a tool specifies an `os` restriction and the current operating system is not in the list, mise will skip installing and using that tool.
+
+## Tool Dependencies
+
+You can declare explicit installation dependencies between tools using the `depends` field. This ensures that one tool is fully installed before another begins installing.
+
+```toml
+[tools]
+python = "3.12.11"
+"pipx:ruff" = { version = "latest", depends = ["python"] }
+```
+
+In this example, `pipx:ruff` will wait for `python` to finish installing before it starts.
+
+The `depends` field accepts either a single string or an array of strings:
+
+```toml
+[tools]
+# Single dependency
+"pipx:ruff" = { version = "latest", depends = "python" }
+
+# Multiple dependencies
+"pipx:ruff" = { version = "latest", depends = ["python", "pipx"] }
+```
+
+User-specified `depends` adds ordering constraints for tools already in the current install set. Use it when one configured tool install must finish before another configured tool install starts, especially when installs would otherwise run in parallel.
+
+### vfox plugin hook dependencies
+
+`depends` in `[tools]` only adds install graph ordering. It does not by itself declare hook-time dependencies or add those tools to the `PATH` used while vfox install hooks run.
+
+For vfox plugins, declare install-hook tool requirements on the `PLUGIN` table in `metadata.lua`:
+
+```lua
+PLUGIN = {
+    name = "example",
+    version = "1.0.0",
+    depends = { "go" },
+}
+```
+
+Use tool names as they would appear in `mise.toml`. When matching tools are configured, mise uses those metadata entries to order current install jobs and to build the hook environment. See [Tool plugin development](/tool-plugin-development#_2-metadata-lua).
 
 ## Caching and Performance
 
@@ -239,24 +299,32 @@ For some users, `mise use` might be the only command you need to learn. It will 
 
 ```shell
 > cd my-project
-> mise use node@24
+> mise use node@26
 # download node, verify signature...
-mise node@24.x.x ✓ installed
-mise ~/my-project/mise.toml tools: node@24.x.x # mise.toml created/updated
+mise node@26.x.x ✓ installed
+mise ~/my-project/mise.toml tools: node@26.x.x # mise.toml created/updated
 
 > which node
-~/.local/share/installs/node/24.x.x/bin/node
+~/.local/share/mise/installs/node/26/bin/node
 ```
 
-`mise use node@24` will install the latest version of node-24 and create/update the
+`mise use node@26` will install the latest version of node-26 and create/update the
 `mise.toml`
-config file in the local directory. Anytime you're in that directory, that version of `node` will be
-used.
+config file in the local directory. The resulting file looks like this:
 
-`mise use -g node@24` will do the same but update the [global config](/configuration.html#global-config-config-mise-config-toml) (~/.config/mise/config.toml) so
-unless there is a config file in the local directory hierarchy, node-24 will be the default version
+```toml [mise.toml]
+[tools]
+node = "26"
+```
+
+Anytime you're in that directory, that version of `node` will be used.
+
+`mise use -g node@26` will do the same but update the [global config](/configuration.html#global-config-config-mise-config-toml) (`~/.config/mise/config.toml`) so
+unless there is a config file in the local directory hierarchy, node-26 will be the default version
 for
 the user.
+
+You can also edit `mise.toml` directly instead of using `mise use` — the effect is the same. Run `mise install` after editing to install any new tools.
 
 ### [`mise install`](/cli/install)
 

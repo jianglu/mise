@@ -63,6 +63,15 @@ pub struct TasksLs {
     #[clap(long, global = true, verbatim_doc_comment)]
     pub hidden: bool,
 
+    /// Only show task names, one per line. Useful for piping to fzf and similar tools.
+    #[clap(
+        long,
+        global = true,
+        verbatim_doc_comment,
+        conflicts_with_all = ["json", "extended", "usage"]
+    )]
+    pub name_only: bool,
+
     /// Do not print table header
     #[clap(long, alias = "no-headers", global = true, verbatim_doc_comment)]
     pub no_header: bool,
@@ -130,7 +139,7 @@ impl TasksLs {
             && !cfg!(windows)
             && let Some(cwd) = &*dirs::CWD
         {
-            let includes = config::task_includes_for_dir(cwd, &config.config_files);
+            let includes = config::task_includes_for_dir(cwd, &config.config_files)?;
             if !find_non_executable_task_files(&includes).is_empty() {
                 warn!(
                     "no tasks found, but non-executable files exist in task directories.\nFiles must be executable to be detected as tasks. Run `chmod +x` on the task files to fix this."
@@ -143,9 +152,18 @@ impl TasksLs {
         } else if self.usage {
             self.display_usage(&config, tasks).await?;
         } else if self.json {
-            self.display_json(tasks)?;
+            self.display_json(&config, tasks).await?;
+        } else if self.name_only {
+            self.display_name_only(tasks)?;
         } else {
             self.display(tasks)?;
+        }
+        Ok(())
+    }
+
+    fn display_name_only(&self, tasks: Vec<Task>) -> Result<()> {
+        for t in tasks {
+            calm_io::stdoutln!("{}", t.display_name)?;
         }
         Ok(())
     }
@@ -208,38 +226,49 @@ impl TasksLs {
         Ok(())
     }
 
-    fn display_json(&self, tasks: Vec<Task>) -> Result<()> {
-        let array_items = tasks
-            .into_iter()
-            .map(|task| {
-                json!({
-                  "name": task.display_name,
-                  "aliases": task.aliases,
-                  "description": task.description,
-                  "source": task.config_source,
-                  "depends": task.depends,
-                  "depends_post": task.depends_post,
-                  "wait_for": task.wait_for,
-                  "env": task.env.0.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
-                  "dir": task.dir,
-                  "hide": task.hide,
-                  "global": task.global,
-                  "raw": task.raw,
-                  "interactive": task.interactive,
-                  "sources": task.sources,
-                  "outputs": task.outputs,
-                  "shell": task.shell,
-                  "quiet": task.quiet,
-                  "silent": task.silent,
-                  "tools": task.tools,
-                  "usage": task.usage,
-                  "timeout": task.timeout,
-                  "run": task.run_script_strings(),
-                  "args": task.args,
-                  "file": task.file
-                })
-            })
-            .collect::<serde_json::Value>();
+    async fn display_json(&self, config: &Arc<Config>, tasks: Vec<Task>) -> Result<()> {
+        let mut array_items: Vec<serde_json::Value> = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            // Report the resolved dir (including any inherited task_config.dir)
+            // so consumers see the directory the task will actually run in.
+            let resolved_dir = task
+                .dir(config)
+                .await?
+                .map(|p| p.to_string_lossy().to_string());
+            let env_strs: Vec<String> = task
+                .env
+                .0
+                .iter()
+                .chain(task.overlay_env.iter().map(|(d, _)| d))
+                .map(|d| d.to_string())
+                .collect();
+            array_items.push(json!({
+                "name": task.display_name,
+                "aliases": task.aliases,
+                "description": task.description,
+                "source": task.config_source,
+                "depends": task.depends,
+                "depends_post": task.depends_post,
+                "wait_for": task.wait_for,
+                "env": env_strs,
+                "dir": resolved_dir,
+                "hide": task.hide,
+                "global": task.global,
+                "raw": task.raw,
+                "interactive": task.interactive,
+                "sources": task.sources,
+                "outputs": task.outputs,
+                "shell": task.shell,
+                "quiet": task.quiet,
+                "silent": task.silent,
+                "tools": task.tools,
+                "usage": task.usage,
+                "timeout": task.timeout,
+                "run": task.run(),
+                "args": task.args,
+                "file": task.file,
+            }));
+        }
         miseprintln!("{}", serde_json::to_string_pretty(&array_items)?);
         Ok(())
     }

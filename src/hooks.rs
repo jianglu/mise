@@ -1,7 +1,7 @@
 use crate::cmd::cmd;
 use crate::config::{Config, Settings, config_file};
 use crate::shell::Shell;
-use crate::tera::get_tera;
+use crate::tera::{contains_template_syntax, get_tera, render_str};
 use crate::toolset::{ToolVersion, Toolset};
 use crate::{dirs, hook_env};
 use eyre::Result;
@@ -51,16 +51,37 @@ pub enum Hooks {
     Postinstall,
 }
 
-/// Represents a hook definition in TOML config.
-/// Supports string, table, task reference, or array formats via serde untagged deserialization.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(untagged)]
+pub enum HookScripts {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl HookScripts {
+    fn into_script(self) -> String {
+        match self {
+            Self::One(script) => script,
+            Self::Many(scripts) => scripts.join("\n"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(untagged)]
 pub enum HookDef {
-    /// Simple script string: `enter = "echo hello"`
-    Script(String),
+    /// Simple run string: `enter = "echo hello"`
+    RunString(String),
+    /// Table with run: `enter = { run = "echo hello" }`
+    Run(HookRunTable),
     /// Table with script and optional shell: `enter = { script = "echo hello", shell = "bash" }`
-    Table {
-        script: String,
+    ScriptTable {
+        script: HookScripts,
+        shell: Option<String>,
+    },
+    /// Table with scripts and optional shell: `enter = { scripts = ["echo hello"], shell = "bash" }`
+    ScriptsTable {
+        scripts: Vec<String>,
         shell: Option<String>,
     },
     /// Task reference: `enter = { task = "setup" }`
@@ -69,29 +90,79 @@ pub enum HookDef {
     Array(Vec<HookDef>),
 }
 
+#[derive(Debug, Clone)]
+pub struct HookRunTable {
+    run: Option<String>,
+    run_windows: Option<String>,
+    shell: Option<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for HookRunTable {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Helper {
+            run: Option<String>,
+            run_windows: Option<String>,
+            shell: Option<String>,
+        }
+
+        let helper = <Helper as serde::Deserialize>::deserialize(deserializer)?;
+        if helper.run.is_none() && helper.run_windows.is_none() {
+            return Err(serde::de::Error::custom(
+                "hook run table must define `run` or `run_windows`",
+            ));
+        }
+        Ok(Self {
+            run: helper.run,
+            run_windows: helper.run_windows,
+            shell: helper.shell,
+        })
+    }
+}
+
 impl HookDef {
     /// Convert to a list of Hook structs with the given hook type
     pub fn into_hooks(self, hook_type: Hooks) -> Vec<Hook> {
         match self {
-            HookDef::Script(script) => vec![Hook {
+            HookDef::RunString(script) => vec![Hook {
                 hook: hook_type,
-                script,
-                shell: None,
-                task_name: None,
+                action: HookAction::Run {
+                    run: Some(script),
+                    run_windows: None,
+                    shell: None,
+                    legacy_script: false,
+                    ignored_shell: None,
+                },
                 global: false,
             }],
-            HookDef::Table { script, shell } => vec![Hook {
+            HookDef::Run(table) => vec![Hook {
                 hook: hook_type,
-                script,
-                shell,
-                task_name: None,
+                action: HookAction::Run {
+                    run: table.run,
+                    run_windows: table.run_windows,
+                    shell: table.shell,
+                    legacy_script: false,
+                    ignored_shell: None,
+                },
+                global: false,
+            }],
+            HookDef::ScriptTable { script, shell } => vec![Hook {
+                hook: hook_type,
+                action: script_hook_action(hook_type, script.into_script(), shell, true),
+                global: false,
+            }],
+            HookDef::ScriptsTable { scripts, shell } => vec![Hook {
+                hook: hook_type,
+                action: script_hook_action(hook_type, scripts.join("\n"), shell, false),
                 global: false,
             }],
             HookDef::TaskRef { task } => vec![Hook {
                 hook: hook_type,
-                script: String::new(),
-                shell: None,
-                task_name: Some(task),
+                action: HookAction::Task { task_name: task },
                 global: false,
             }],
             HookDef::Array(arr) => arr
@@ -102,15 +173,90 @@ impl HookDef {
     }
 }
 
+fn script_hook_action(
+    hook_type: Hooks,
+    script: String,
+    shell: Option<String>,
+    legacy_script: bool,
+) -> HookAction {
+    match (hook_type, shell) {
+        (Hooks::Enter | Hooks::Leave | Hooks::Cd, Some(shell)) => {
+            HookAction::CurrentShell { script, shell }
+        }
+        (_, shell) => HookAction::Run {
+            run: Some(script),
+            run_windows: None,
+            shell: None,
+            legacy_script,
+            ignored_shell: shell,
+        },
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Hook {
     pub hook: Hooks,
-    pub script: String,
-    pub shell: Option<String>,
-    /// Task name to run instead of a script
-    pub task_name: Option<String>,
+    pub action: HookAction,
     /// Whether this hook comes from a global config (skip directory matching)
     pub global: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub enum HookAction {
+    Run {
+        run: Option<String>,
+        run_windows: Option<String>,
+        shell: Option<String>,
+        legacy_script: bool,
+        ignored_shell: Option<String>,
+    },
+    CurrentShell {
+        script: String,
+        shell: String,
+    },
+    Task {
+        task_name: String,
+    },
+}
+
+impl Hook {
+    pub fn render_templates<F>(&mut self, mut render: F) -> Result<()>
+    where
+        F: FnMut(&str) -> Result<String>,
+    {
+        match &mut self.action {
+            HookAction::Run {
+                run,
+                run_windows,
+                shell,
+                ignored_shell,
+                ..
+            } => {
+                let run = if cfg!(windows) {
+                    run_windows.as_mut().or(run.as_mut())
+                } else {
+                    run.as_mut()
+                };
+                if let Some(s) = run {
+                    *s = render(s)?;
+                    if let Some(s) = shell {
+                        *s = render(s)?;
+                    }
+                    if let Some(s) = ignored_shell {
+                        *s = render(s)?;
+                    }
+                }
+            }
+            HookAction::CurrentShell { script, shell } => {
+                *script = render(script)?;
+                *shell = render(shell)?;
+            }
+            HookAction::Task { task_name } => {
+                *task_name = render(task_name)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub static SCHEDULED_HOOKS: Lazy<Mutex<IndexSet<Hooks>>> = Lazy::new(Default::default);
@@ -182,8 +328,9 @@ pub async fn run_one_hook_with_context(
     if Settings::no_hooks() || Settings::get().no_hooks.unwrap_or(false) {
         return;
     }
+    let shell_name = shell.map(|s| s.to_string()).unwrap_or_default();
     for (root, h) in all_hooks(config).await {
-        if hook != h.hook || (h.shell.is_some() && h.shell != shell.map(|s| s.to_string())) {
+        if hook != h.hook || !matches_shell(h, &shell_name) {
             continue;
         }
         trace!("running hook {hook} in {root:?}");
@@ -206,10 +353,8 @@ pub async fn run_one_hook_with_context(
                         continue;
                     }
                 }
-                (Hooks::Cd, Some((_old, new))) => {
-                    if !new.starts_with(root) {
-                        continue;
-                    }
+                (Hooks::Cd, Some((_old, new))) if !new.starts_with(root) => {
+                    continue;
                 }
                 // Pre/postinstall hooks only run if CWD is under the config root
                 (Hooks::Preinstall | Hooks::Postinstall, _) => {
@@ -222,11 +367,65 @@ pub async fn run_one_hook_with_context(
                 _ => {}
             }
         }
-        if h.task_name.is_some() {
-            if let Err(e) = execute_task(config, ts, root, h, installed_tools).await {
-                warn!("{hook} hook in {} failed: {e}", root.display());
+        run_matched_hook(config, ts, root, h, shell, installed_tools).await;
+    }
+}
+
+pub async fn run_enter_hooks_for_newly_loaded_configs(
+    config: &Arc<Config>,
+    ts: &Toolset,
+    shell: &dyn Shell,
+) {
+    if Settings::no_hooks() || Settings::get().no_hooks.unwrap_or(false) {
+        return;
+    }
+    if hook_env::dir_change().is_some() {
+        return;
+    }
+    let Some(cwd) = dirs::CWD.as_ref() else {
+        return;
+    };
+    let newly_loaded_roots = config
+        .config_files
+        .iter()
+        .filter(|(path, _)| !hook_env::PREV_SESSION.loaded_configs.contains(*path))
+        .filter_map(|(_, cf)| cf.project_root())
+        .filter(|root| cwd.starts_with(root))
+        .collect::<IndexSet<_>>();
+    if newly_loaded_roots.is_empty() {
+        return;
+    }
+    let shell_name = shell.to_string();
+    for (root, h) in config.hooks().await.cloned().unwrap_or_default() {
+        if h.hook != Hooks::Enter || h.global || !cwd.starts_with(&root) {
+            continue;
+        }
+        if !matches_shell(&h, &shell_name) {
+            continue;
+        }
+        if !newly_loaded_roots.contains(&root) {
+            continue;
+        }
+        run_matched_hook(config, ts, &root, &h, Some(shell), None).await;
+    }
+}
+
+async fn run_matched_hook(
+    config: &Arc<Config>,
+    ts: &Toolset,
+    root: &Path,
+    hook: &Hook,
+    shell: Option<&dyn Shell>,
+    installed_tools: Option<&[InstalledToolInfo]>,
+) {
+    let hook_type = hook.hook;
+    match &hook.action {
+        HookAction::Task { task_name } => {
+            if let Err(e) = execute_task(config, ts, root, hook, task_name, installed_tools).await {
+                warn!("{hook_type} hook in {} failed: {e}", root.display());
             }
-        } else if h.shell.is_some() {
+        }
+        HookAction::CurrentShell { script, .. } => {
             if let Some(shell) = shell {
                 // Set hook environment variables so shell hooks can access them
                 println!(
@@ -255,11 +454,22 @@ pub async fn run_one_hook_with_context(
                     println!("{}", shell.set_env("MISE_INSTALLED_TOOLS", &json));
                 }
             }
-            println!("{}", h.script);
-        } else if let Err(e) = execute(config, ts, root, h, installed_tools).await {
-            // Warn but continue running remaining hooks of this type
-            warn!("{hook} hook in {} failed: {e}", root.display());
+            println!("{script}");
         }
+        HookAction::Run { .. } => {
+            if let Err(e) = execute(config, ts, root, hook, installed_tools).await {
+                // Warn but continue running remaining hooks of this type
+                warn!("{hook_type} hook in {} failed: {e}", root.display());
+            }
+        }
+    }
+}
+
+fn matches_shell(hook: &Hook, shell_name: &str) -> bool {
+    if let HookAction::CurrentShell { shell, .. } = &hook.action {
+        shell == shell_name
+    } else {
+        true
     }
 }
 
@@ -270,23 +480,72 @@ async fn execute(
     hook: &Hook,
     installed_tools: Option<&[InstalledToolInfo]>,
 ) -> Result<()> {
-    Settings::get().ensure_experimental("hooks")?;
-    let shell = Settings::get().default_inline_shell()?;
+    let HookAction::Run {
+        run,
+        run_windows,
+        shell,
+        legacy_script,
+        ignored_shell,
+    } = &hook.action
+    else {
+        return Ok(());
+    };
+    if *legacy_script {
+        deprecated_at!(
+            "2026.9.0",
+            "2027.3.0",
+            "hook_script_table_spawned_run",
+            "hook tables using `script` for spawned commands are deprecated. Use `run` instead."
+        );
+    }
+    if ignored_shell.is_some() && matches!(hook.hook, Hooks::Preinstall | Hooks::Postinstall) {
+        let hook_name = hook.hook.to_string().to_lowercase();
+        warn!(
+            "`shell` is ignored for {} hooks that use `script`/`scripts`; use `run = ...` with `shell = \"bash -c\"` to choose an inline shell command.",
+            hook_name
+        );
+    }
+    let run = if cfg!(windows) {
+        run_windows.as_deref().or(run.as_deref())
+    } else {
+        run.as_deref()
+    };
+    let Some(run) = run else {
+        return Ok(());
+    };
+    let shell = shell
+        .as_ref()
+        .map(|shell| crate::path::split_shell_command(shell))
+        .transpose()?
+        .unwrap_or(Settings::get().default_inline_shell()?);
 
     // Preinstall hooks skip `tools=true` env directives since the tools
     // providing those env vars aren't installed yet (fixes #6162)
     let (tera_ctx, mut env) = if hook.hook == Hooks::Preinstall {
         let env = ts.full_env_without_tools(config).await?;
-        let mut ctx = config.tera_ctx.clone();
-        ctx.insert("env", &env);
+        let ctx = if contains_template_syntax(run) {
+            let mut ctx = config.tera_ctx.clone();
+            ctx.insert("env", &env);
+            Some(ctx)
+        } else {
+            None
+        };
         (ctx, env)
     } else {
-        let ctx = ts.tera_ctx(config).await?.clone();
         let env = ts.full_env(config).await?;
+        let ctx = if contains_template_syntax(run) {
+            Some(ts.tera_ctx(config).await?.clone())
+        } else {
+            None
+        };
         (ctx, env)
     };
-    let mut tera = get_tera(Some(root));
-    let rendered_script = tera.render_str(&hook.script, &tera_ctx)?;
+    let rendered_script = if let Some(tera_ctx) = tera_ctx {
+        let mut tera = get_tera(Some(root));
+        render_str(&mut tera, run, &tera_ctx)?
+    } else {
+        run.to_string()
+    };
 
     let args = shell
         .iter()
@@ -323,6 +582,47 @@ async fn execute(
     // Prevent recursive hook execution (e.g. hook runs `mise run` which spawns
     // a shell that activates mise and re-triggers hooks)
     env.insert("MISE_NO_HOOKS".to_string(), "1".to_string());
+
+    // On Windows, when the hook shell is cmd.exe, the rendered command must be
+    // passed to cmd *verbatim*. Going through std/duct's MSVCRT-style quoting
+    // would escape inner `"` as `\"`, which cmd.exe does not understand, so a
+    // hook like `python -c "import x"` is mangled. Unlike tasks, hooks have no
+    // `usage`/shebang/file-based escape hatch, so this is the only fix. duct
+    // can't emit raw args, so spawn std Command directly with raw command-line
+    // args (wrapped in one outer quote pair + `/s`), forwarding stdout to stderr
+    // to match the duct path's `stdout_to_stderr()`. See discussion #9355.
+    #[cfg(windows)]
+    {
+        let runs_command = shell
+            .iter()
+            .skip(1)
+            .any(|f| f.eq_ignore_ascii_case("/c") || f.eq_ignore_ascii_case("/k"));
+        if crate::path::is_cmd_shell_program(Path::new(&shell[0])) && runs_command {
+            use std::os::windows::io::AsHandle;
+            use std::os::windows::process::CommandExt;
+            let cmd_args = crate::path::cmd_verbatim_args(&shell[1..], &rendered_script, &[]);
+            trace!("hook (cmd verbatim): {} {}", shell[0], cmd_args.join(" "));
+            let mut c = std::process::Command::new(&shell[0]);
+            for a in &cmd_args {
+                c.raw_arg(a);
+            }
+            c.env_clear();
+            c.envs(env.iter());
+            // Send the hook's stdout to mise's stderr (matching the duct
+            // `stdout_to_stderr()` the non-cmd path uses) by handing the child a
+            // clone of our stderr handle. Redirecting the descriptor directly —
+            // rather than piping through a reader thread — means a hook that
+            // spawns a background child holding the write end can't block us
+            // waiting for pipe EOF, and stdout/stderr ordering is preserved.
+            c.stdout(std::io::stderr().as_handle().try_clone_to_owned()?);
+            let status = c.status()?;
+            if !status.success() {
+                eyre::bail!("hook command failed: {status}");
+            }
+            return Ok(());
+        }
+    }
+
     cmd(&shell[0], args)
         .stdout_to_stderr()
         // .dir(root)
@@ -336,14 +636,9 @@ async fn execute_task(
     ts: &Toolset,
     root: &Path,
     hook: &Hook,
+    task_name: &str,
     installed_tools: Option<&[InstalledToolInfo]>,
 ) -> Result<()> {
-    Settings::get().ensure_experimental("hooks")?;
-    let task_name = hook
-        .task_name
-        .as_ref()
-        .ok_or_else(|| eyre::eyre!("hook has no task name"))?;
-
     let mise_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("mise"));
 
     let mut env = if hook.hook == Hooks::Preinstall {
@@ -380,10 +675,47 @@ async fn execute_task(
 
     cmd(
         mise_bin,
-        ["--cd", &root.to_string_lossy(), "run", task_name.as_str()],
+        ["--cd", &root.to_string_lossy(), "run", task_name],
     )
     .stdout_to_stderr()
     .full_env(env)
     .run()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct TestHook {
+        hook: HookDef,
+    }
+
+    #[test]
+    fn run_table_supports_run_windows() {
+        let parsed: TestHook = toml::from_str(
+            r#"
+            hook = { run = "echo unix", run_windows = "echo windows", shell = "bash -c" }
+            "#,
+        )
+        .unwrap();
+        let hooks = parsed.hook.into_hooks(Hooks::Postinstall);
+
+        assert_eq!(hooks.len(), 1);
+        match &hooks[0].action {
+            HookAction::Run {
+                run,
+                run_windows,
+                shell,
+                ..
+            } => {
+                assert_eq!(run.as_deref(), Some("echo unix"));
+                assert_eq!(run_windows.as_deref(), Some("echo windows"));
+                assert_eq!(shell.as_deref(), Some("bash -c"));
+            }
+            action => panic!("expected run hook, got {action:?}"),
+        }
+    }
 }

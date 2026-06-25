@@ -1,14 +1,9 @@
 #!/usr/bin/env bash
 
 # Test MCP protocol interactions in more detail
-export MISE_EXPERIMENTAL=1
 
-# Create a test environment with tools, tasks and env vars
+# Create a test environment with tasks and env vars
 cat >mise.toml <<EOF
-[tools]
-node = "20.11.0"
-python = "3.12"
-
 [env]
 TEST_MCP_VAR = "test_value"
 PROJECT_ENV = "development"
@@ -41,10 +36,10 @@ echo "Testing MCP server startup and error handling..."
 # Test that MCP server rejects invalid JSON
 output=$(echo "not json" | mise mcp 2>&1 || true)
 if [[ $output == *"Failed to create service"* ]]; then
-	echo "SUCCESS: MCP server correctly rejected invalid JSON"
+  echo "SUCCESS: MCP server correctly rejected invalid JSON"
 else
-	echo "ERROR: Expected 'Failed to create service' in output, got: $output"
-	exit 1
+  echo "ERROR: Expected 'Failed to create service' in output, got: $output"
+  exit 1
 fi
 
 echo -e "\nTesting MCP protocol with actual requests..."
@@ -244,7 +239,7 @@ def main():
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        env={**dict(os.environ), "MISE_EXPERIMENTAL": "1"},
+        env=dict(os.environ),
     )
 
     try:

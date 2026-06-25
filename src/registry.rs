@@ -1,10 +1,10 @@
 use crate::backend::backend_type::BackendType;
 use crate::cli::args::BackendArg;
 use crate::config::Settings;
-use crate::toolset::ToolVersionOptions;
+use crate::toolset::{RawBackendOptions, ToolVersionOptions};
 use heck::ToShoutySnakeCase;
 use indexmap::IndexMap;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::env::consts::{ARCH, OS};
 use std::fmt::Display;
@@ -14,8 +14,34 @@ use strum::IntoEnumIterator;
 use url::Url;
 
 // the registry is generated from registry/ in the project root
-pub static REGISTRY: Lazy<BTreeMap<&'static str, RegistryTool>> =
-    Lazy::new(|| include!(concat!(env!("OUT_DIR"), "/registry.rs")));
+pub static REGISTRY: Registry = include!(concat!(env!("OUT_DIR"), "/registry.rs"));
+
+pub struct Registry {
+    entries: &'static [(&'static str, RegistryTool)],
+    lookup: phf::Map<&'static str, usize>,
+}
+
+impl Registry {
+    pub fn get(&self, name: &str) -> Option<&'static RegistryTool> {
+        self.lookup.get(name).map(|index| &self.entries[*index].1)
+    }
+
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.lookup.contains_key(name)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&'static str, &'static RegistryTool)> {
+        self.entries.iter().map(|(name, tool)| (*name, tool))
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &'static str> {
+        self.entries.iter().map(|(name, _)| *name)
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &'static RegistryTool> {
+        self.entries.iter().map(|(_, tool)| tool)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RegistryTool {
@@ -25,11 +51,17 @@ pub struct RegistryTool {
     #[allow(unused)]
     pub aliases: &'static [&'static str],
     pub overrides: &'static [&'static str],
-    pub test: &'static Option<(&'static str, &'static str)>,
+    pub test: &'static Option<RegistryToolTest>,
     pub os: &'static [&'static str],
-    pub depends: &'static [&'static str],
     pub idiomatic_files: &'static [&'static str],
     pub detect: &'static [&'static str],
+}
+
+#[derive(Debug, Clone)]
+pub struct RegistryToolTest {
+    pub cmd: &'static str,
+    pub expected: &'static str,
+    pub tools: &'static [&'static str],
 }
 
 #[derive(Debug, Clone)]
@@ -131,18 +163,15 @@ impl RegistryTool {
 
         if let Some(backend) = self.get_backend(full) {
             for (k, v) in backend.options {
-                // Try to parse as TOML to preserve nested table structure
-                // (e.g., platforms with per-platform options like asset_pattern)
-                let value = match toml::from_str::<toml::Value>(v) {
-                    Ok(parsed) if parsed.is_table() => parsed,
-                    _ => toml::Value::String(v.to_string()),
-                };
+                let value = v.parse::<toml::Value>().unwrap_or_else(|e| {
+                    panic!("failed to parse registry option {k} as a TOML value: {e}")
+                });
                 opts.insert(k.to_string(), value);
             }
         }
 
         ToolVersionOptions {
-            opts,
+            opts: RawBackendOptions::from(opts),
             ..Default::default()
         }
     }
@@ -163,15 +192,35 @@ pub fn shorts_for_full(full: &str) -> &'static Vec<&'static str> {
 }
 
 pub fn is_trusted_plugin(name: &str, remote: &str) -> bool {
-    let normalized_url = normalize_remote(remote).unwrap_or("INVALID_URL".into());
-    let is_shorthand = REGISTRY
-        .get(name)
-        .and_then(|tool| tool.backends().first().copied())
-        .map(full_to_url)
-        .is_some_and(|s| normalize_remote(&s).unwrap_or_default() == normalized_url);
-    let is_mise_url = normalized_url.starts_with("github.com/mise-plugins/");
+    let Ok(normalized_url) = normalize_remote(remote) else {
+        return false;
+    };
+    if normalized_url.starts_with("github.com/mise-plugins/") {
+        return true;
+    }
 
-    !is_shorthand || is_mise_url
+    let official_registry_plugin_remotes = || {
+        static REMOTES: Lazy<HashSet<String>> = Lazy::new(|| {
+            REGISTRY
+                .values()
+                .flat_map(|tool| tool.backends.iter().map(|backend| backend.full))
+                .filter(|full| full.starts_with("asdf:") || full.starts_with("vfox:"))
+                .filter_map(|full| normalize_remote(&full_to_url(full)).ok())
+                .collect()
+        });
+        &*REMOTES
+    };
+
+    let name_matches_official_remote = REGISTRY.get(name).is_some_and(|tool| {
+        tool.backends
+            .iter()
+            .map(|backend| backend.full)
+            .filter(|full| full.starts_with("asdf:") || full.starts_with("vfox:"))
+            .filter_map(|full| normalize_remote(&full_to_url(full)).ok())
+            .any(|official_remote| official_remote == normalized_url)
+    });
+
+    name_matches_official_remote || official_registry_plugin_remotes().contains(&normalized_url)
 }
 
 pub fn normalize_remote(remote: &str) -> eyre::Result<String> {
@@ -209,15 +258,20 @@ impl Display for RegistryTool {
     }
 }
 
+/// Returns true when `name` passes the configured tool filter.
+///
+/// `None` means no allowlist is configured, so `disable_tools` excludes
+/// individual tools. `Some(empty)` is an explicit empty allowlist and disables
+/// every tool. When an allowlist is configured, it is authoritative and
+/// `disable_tools` is not applied.
 pub fn tool_enabled<T: Ord>(
-    enable_tools: &BTreeSet<T>,
+    enable_tools: Option<&BTreeSet<T>>,
     disable_tools: &BTreeSet<T>,
     name: &T,
 ) -> bool {
-    if enable_tools.is_empty() {
-        !disable_tools.contains(name)
-    } else {
-        enable_tools.contains(name)
+    match enable_tools {
+        Some(enable_tools) => enable_tools.contains(name),
+        None => !disable_tools.contains(name),
     }
 }
 
@@ -225,23 +279,94 @@ pub fn tool_enabled<T: Ord>(
 mod tests {
     use crate::config::Config;
 
-    #[tokio::test]
-    async fn test_tool_disabled() {
-        let _config = Config::get().await.unwrap();
+    #[test]
+    fn test_tool_disabled() {
         use super::*;
         let name = "cargo";
 
-        assert!(tool_enabled(&BTreeSet::new(), &BTreeSet::new(), &name));
-        assert!(tool_enabled(
-            &BTreeSet::from(["cargo"]),
-            &BTreeSet::new(),
-            &name
-        ));
+        assert!(tool_enabled(None, &BTreeSet::new(), &name));
         assert!(!tool_enabled(
+            Some(&BTreeSet::new()),
             &BTreeSet::new(),
+            &name
+        ));
+        assert!(tool_enabled(
+            Some(&BTreeSet::from(["cargo"])),
+            &BTreeSet::new(),
+            &name
+        ));
+        assert!(!tool_enabled(None, &BTreeSet::from(["cargo"]), &name));
+        assert!(tool_enabled(
+            Some(&BTreeSet::from(["cargo"])),
             &BTreeSet::from(["cargo"]),
             &name
         ));
+    }
+
+    #[test]
+    fn test_registry_iteration_is_sorted() {
+        use super::*;
+
+        // The interactive tool selector and --all test-tool path consume registry
+        // iteration order directly, so keep PHF lookup separate from sorted output.
+        let keys = REGISTRY.keys().collect::<Vec<_>>();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+
+        assert!(!keys.is_empty());
+        assert_eq!(keys, sorted);
+    }
+
+    #[test]
+    fn test_backend_options_parse_toml_values() {
+        use super::*;
+
+        static OPTIONS: &[(&str, &str)] = &[
+            ("bin", r#""rg""#),
+            ("prerelease", "true"),
+            ("strip_components", "1"),
+            (
+                "targets",
+                r#"["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]"#,
+            ),
+            (
+                "platforms",
+                r#"{ linux-x64 = { asset_pattern = "tool-linux.tar.gz" } }"#,
+            ),
+        ];
+        static BACKENDS: &[RegistryBackend] = &[RegistryBackend {
+            full: "github:owner/repo",
+            platforms: &[],
+            options: OPTIONS,
+        }];
+        let tool = RegistryTool {
+            short: "test",
+            description: None,
+            backends: BACKENDS,
+            aliases: &[],
+            overrides: &[],
+            test: &None,
+            os: &[],
+            idiomatic_files: &[],
+            detect: &[],
+        };
+
+        let opts = tool.backend_options("github:owner/repo");
+
+        assert_eq!(opts.get("bin"), Some("rg"));
+        assert_eq!(
+            opts.opts.get("prerelease"),
+            Some(&toml::Value::Boolean(true))
+        );
+        assert_eq!(
+            opts.opts.get("strip_components"),
+            Some(&toml::Value::Integer(1))
+        );
+        assert!(opts.opts.get("targets").is_some_and(toml::Value::is_array));
+        assert_eq!(
+            opts.get_nested_string("platforms.linux-x64.asset_pattern"),
+            Some("tool-linux.tar.gz".to_string())
+        );
     }
 
     #[tokio::test]
@@ -292,5 +417,46 @@ mod tests {
         // Invalid URLs should return an error
         let result = normalize_remote("not-a-url");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_is_trusted_plugin_rejects_non_normalizable_remote() {
+        use super::*;
+
+        assert!(!is_trusted_plugin("cmake", "not-a-url"));
+    }
+
+    #[test]
+    fn test_is_trusted_plugin_rejects_non_registry_plugin_url() {
+        use super::*;
+
+        assert!(!is_trusted_plugin(
+            "vfox-attacker-evil",
+            "https://github.com/attacker/evil.git"
+        ));
+    }
+
+    #[test]
+    fn test_is_trusted_plugin_accepts_official_registry_plugin_url() {
+        use super::*;
+
+        assert!(is_trusted_plugin(
+            "cmake",
+            "https://github.com/mise-plugins/vfox-cmake.git"
+        ));
+        assert!(is_trusted_plugin(
+            "vfox-echocat-vfox-mongod",
+            "https://github.com/echocat/vfox-mongod.git"
+        ));
+    }
+
+    #[test]
+    fn test_is_trusted_plugin_rejects_shorthand_mismatch() {
+        use super::*;
+
+        assert!(!is_trusted_plugin(
+            "cmake",
+            "https://github.com/attacker/vfox-cmake.git"
+        ));
     }
 }

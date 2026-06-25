@@ -244,19 +244,84 @@ pub static MISE_DEFAULT_CONFIG_FILENAME: Lazy<String> = Lazy::new(|| {
 pub static MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES: Lazy<Option<IndexSet<String>>> =
     Lazy::new(|| match var("MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES") {
         Ok(v) if v == "none" => Some([].into()),
-        Ok(v) => Some(v.split(':').map(|s| s.to_string()).collect()),
+        Ok(v) => Some(split_colon_list(&v)),
         Err(_) => {
             miserc::get_override_tool_versions_filenames().map(|v| v.iter().cloned().collect())
         }
     });
 pub static MISE_OVERRIDE_CONFIG_FILENAMES: Lazy<IndexSet<String>> =
     Lazy::new(|| match var("MISE_OVERRIDE_CONFIG_FILENAMES") {
-        Ok(v) => v.split(':').map(|s| s.to_string()).collect(),
+        Ok(v) => split_colon_list(&v),
         Err(_) => miserc::get_override_config_filenames()
             .map(|v| v.iter().cloned().collect())
             .unwrap_or_default(),
     });
 pub static MISE_ENV: Lazy<Vec<String>> = Lazy::new(|| environment(&ARGS.read().unwrap()));
+
+/// The tri-state auto_env setting: MISE_AUTO_ENV env var > .miserc.toml > unset
+pub fn auto_env_setting() -> Option<bool> {
+    if var_is_true("MISE_AUTO_ENV") {
+        Some(true)
+    } else if var_is_false("MISE_AUTO_ENV") {
+        Some(false)
+    } else {
+        miserc::get_auto_env()
+    }
+}
+
+/// Default for auto_env when the setting is unset: off until mise 2027.6.0
+pub(crate) fn auto_env_default_for_version(v: &versions::Versioning) -> bool {
+    *v >= versions::Versioning::new("2027.6.0").unwrap()
+}
+
+/// Platform-derived environment names, regardless of whether auto_env is enabled.
+/// Ordered least to most specific: os family ("unix"), os, "{os}-{arch}".
+/// On Windows the family equals the os so it dedupes to ["windows", "windows-{arch}"].
+pub fn platform_env_names() -> Vec<String> {
+    let mut names: Vec<String> = vec![];
+    for name in [
+        consts::FAMILY.to_string(),
+        crate::cli::version::OS.to_string(),
+        format!(
+            "{}-{}",
+            *crate::cli::version::OS,
+            *crate::cli::version::ARCH
+        ),
+    ] {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// Platform environments active for config file discovery and lockfile selection.
+/// Empty unless auto_env is enabled. Names already in MISE_ENV are excluded so
+/// explicit environments keep their user-specified (higher) precedence.
+/// These are deliberately not part of MISE_ENV: they do not affect the
+/// `{{ mise_env }}` template variable or MISE_ENV propagation to subprocesses.
+pub static AUTO_ENV_NAMES: Lazy<Vec<String>> = Lazy::new(|| {
+    let enabled =
+        auto_env_setting().unwrap_or_else(|| auto_env_default_for_version(&crate::cli::version::V));
+    if !enabled {
+        return vec![];
+    }
+    platform_env_names()
+        .into_iter()
+        .filter(|name| !MISE_ENV.contains(name))
+        .collect()
+});
+
+/// Auto platform envs followed by explicit MISE_ENV entries, for "later wins"
+/// consumers like config filename enumeration.
+pub static MISE_ENV_WITH_AUTO: Lazy<Vec<String>> = Lazy::new(|| {
+    AUTO_ENV_NAMES
+        .iter()
+        .chain(MISE_ENV.iter())
+        .cloned()
+        .collect()
+});
+
 pub static MISE_GLOBAL_CONFIG_FILE: Lazy<Option<PathBuf>> =
     Lazy::new(|| var_path("MISE_GLOBAL_CONFIG_FILE").or_else(|| var_path("MISE_CONFIG_FILE")));
 pub static MISE_GLOBAL_CONFIG_ROOT: Lazy<PathBuf> =
@@ -264,12 +329,10 @@ pub static MISE_GLOBAL_CONFIG_ROOT: Lazy<PathBuf> =
 pub static MISE_SYSTEM_CONFIG_FILE: Lazy<Option<PathBuf>> =
     Lazy::new(|| var_path("MISE_SYSTEM_CONFIG_FILE"));
 pub static MISE_IGNORED_CONFIG_PATHS: Lazy<Vec<PathBuf>> = Lazy::new(|| {
-    var("MISE_IGNORED_CONFIG_PATHS")
-        .ok()
+    var_os("MISE_IGNORED_CONFIG_PATHS")
         .map(|v| {
-            v.split(':')
-                .filter(|p| !p.is_empty())
-                .map(PathBuf::from)
+            split_paths(&v)
+                .filter(|p| !p.as_os_str().is_empty())
                 .map(replace_path)
                 .collect()
         })
@@ -280,8 +343,7 @@ pub static MISE_IGNORED_CONFIG_PATHS: Lazy<Vec<PathBuf>> = Lazy::new(|| {
         .unwrap_or_default()
 });
 pub static MISE_CEILING_PATHS: Lazy<HashSet<PathBuf>> = Lazy::new(|| {
-    var("MISE_CEILING_PATHS")
-        .ok()
+    var_os("MISE_CEILING_PATHS")
         .map(|v| {
             split_paths(&v)
                 .filter(|p| !p.as_os_str().is_empty())
@@ -358,6 +420,7 @@ pub static MISE_SELF_UPDATE_DISABLED_PATH: Lazy<Option<PathBuf>> = Lazy::new(|| 
     )
 });
 pub static MISE_LOG_HTTP: Lazy<bool> = Lazy::new(|| var_is_true("MISE_LOG_HTTP"));
+pub static MISE_LOG_VERBOSE_DEPS: Lazy<bool> = Lazy::new(|| var_is_true("MISE_LOG_VERBOSE_DEPS"));
 
 pub static __USAGE: Lazy<Option<String>> = Lazy::new(|| var("__USAGE").ok());
 
@@ -416,6 +479,7 @@ pub static __MISE_ZSH_PRECMD_RUN: Lazy<bool> = Lazy::new(|| !var_is_false("__MIS
 pub static LINUX_DISTRO: Lazy<Option<String>> = Lazy::new(linux_distro);
 /// Detected glibc version on Linux as (major, minor), e.g. (2, 17).
 /// Returns None on non-Linux or if detection fails.
+#[cfg_attr(windows, allow(dead_code))]
 pub static LINUX_GLIBC_VERSION: Lazy<Option<(u32, u32)>> = Lazy::new(linux_glibc_version);
 pub static PREFER_OFFLINE: Lazy<AtomicBool> =
     Lazy::new(|| prefer_offline(&ARGS.read().unwrap()).into());
@@ -425,13 +489,20 @@ pub static WARN_ON_MISSING_REQUIRED_ENV: Lazy<bool> =
 /// essentially, this is whether we show spinners or build output on runtime install
 pub static PRISTINE_ENV: Lazy<EnvMap> =
     Lazy::new(|| get_pristine_env(&__MISE_DIFF, vars_safe().collect()));
-pub static PATH_KEY: Lazy<String> = Lazy::new(|| {
-    vars_safe()
-        .map(|(k, _)| k)
-        .find_or_first(|k| k.to_uppercase() == "PATH")
-        .map(|k| k.to_string())
+pub static PATH_KEY: Lazy<String> =
+    Lazy::new(|| path_key_from_env(vars_os().filter_map(|(k, _)| k.into_string().ok())));
+
+#[cfg(unix)]
+fn path_key_from_env(_keys: impl IntoIterator<Item = String>) -> String {
+    "PATH".into()
+}
+
+#[cfg(windows)]
+fn path_key_from_env(keys: impl IntoIterator<Item = String>) -> String {
+    keys.into_iter()
+        .find(|k| k.eq_ignore_ascii_case("PATH"))
         .unwrap_or("PATH".into())
-});
+}
 pub static PATH: Lazy<Vec<PathBuf>> = Lazy::new(|| match PRISTINE_ENV.get(&*PATH_KEY) {
     Some(path) => split_paths(path).collect(),
     None => vec![],
@@ -442,6 +513,17 @@ pub static PATH_NON_PRISTINE: Lazy<Vec<PathBuf>> = Lazy::new(|| match var(&*PATH
 });
 pub static DIRENV_DIFF: Lazy<Option<String>> = Lazy::new(|| var("DIRENV_DIFF").ok());
 
+/// GitHub token resolved from environment variables ONLY
+/// (`MISE_GITHUB_TOKEN`, `GITHUB_API_TOKEN`, `GITHUB_TOKEN`).
+///
+/// Intended for subprocess env-var plumbing — passing a token to child processes such as
+/// `cargo install` or `ruby-build` that read it themselves.
+///
+/// **Do not use for mise's own HTTP or sigstore calls.** Use
+/// [`crate::github::resolve_token_for_api_url`] (which walks env vars,
+/// `credential_command`, `github_tokens.toml`, gh CLI, and git credentials) or the
+/// [`crate::github::sigstore`] wrapper (which calls it internally). Passing this static
+/// to attestation verification is the original cause of the lock-time rate-limit bug.
 pub static GITHUB_TOKEN: Lazy<Option<String>> =
     Lazy::new(|| get_token(&["MISE_GITHUB_TOKEN", "GITHUB_API_TOKEN", "GITHUB_TOKEN"]));
 pub static MISE_GITHUB_ENTERPRISE_TOKEN: Lazy<Option<String>> =
@@ -450,8 +532,6 @@ pub static GITLAB_TOKEN: Lazy<Option<String>> =
     Lazy::new(|| get_token(&["MISE_GITLAB_TOKEN", "GITLAB_TOKEN"]));
 pub static MISE_GITLAB_ENTERPRISE_TOKEN: Lazy<Option<String>> =
     Lazy::new(|| get_token(&["MISE_GITLAB_ENTERPRISE_TOKEN"]));
-pub static FORGEJO_TOKEN: Lazy<Option<String>> =
-    Lazy::new(|| get_token(&["MISE_FORGEJO_TOKEN", "FORGEJO_TOKEN"]));
 pub static MISE_FORGEJO_ENTERPRISE_TOKEN: Lazy<Option<String>> =
     Lazy::new(|| get_token(&["MISE_FORGEJO_ENTERPRISE_TOKEN"]));
 
@@ -614,6 +694,7 @@ fn prefer_offline(args: &[String]) -> bool {
                 "hook-env",
                 "ls",
                 "where",
+                "which",
                 "x",
             ]
             .contains(&a.as_str())
@@ -646,16 +727,47 @@ fn environment(args: &[String]) -> Vec<String> {
         // When running as shim, ignore command line args and use env vars only
         vec![]
     } else {
+        // Subcommands where positional args accept hyphen values, so -E after the
+        // first positional would be a task arg, not a global flag.
+        let run_subcommands: HashSet<&str> = HashSet::from(["run", "r"]);
         // Try to get from command line args first
-        args.windows(2)
-            .take_while(|window| !window.iter().any(|a| a == "--"))
-            .filter_map(|window| {
-                if arg_defs.contains(&*window[0]) {
-                    Some(window[1].clone())
-                } else {
-                    None
+        // Handles `--env production`, `--env=production`, `-E production`, `-E=production`,
+        // and `-Eproduction`.
+        let mut values = Vec::new();
+        let mut it = args.iter().take_while(|a| a.as_str() != "--");
+        let mut in_run_subcommand = false;
+        while let Some(arg) = it.next() {
+            if arg.starts_with('-') {
+                if arg_defs.contains(arg.as_str()) {
+                    // Case: `-E production` or `--env production`
+                    if let Some(next) = it.next() {
+                        values.push(next.to_string());
+                    }
+                } else if let Some((prefix, rest)) = arg.split_at_checked(2)
+                    && !rest.starts_with('=')
+                    && arg_defs.contains(prefix)
+                {
+                    // Case: `-Eproduction`
+                    values.push(rest.to_string());
+                } else if let Some((flag, value)) = arg.split_once('=') {
+                    // Case: `-E=production` or `--env=production`
+                    if arg_defs.contains(flag) {
+                        values.push(value.to_string());
+                    }
                 }
-            })
+            } else {
+                // After `run`/`r`, the first positional is the task name — everything
+                // after that belongs to the task, so stop scanning for env flags.
+                if in_run_subcommand {
+                    break;
+                }
+                if run_subcommands.contains(arg.as_str()) {
+                    in_run_subcommand = true;
+                }
+            }
+        }
+        values
+            .into_iter()
             .flat_map(|s| {
                 s.split(',')
                     .filter(|s| !s.is_empty())
@@ -687,10 +799,7 @@ fn log_file_level() -> Option<LevelFilter> {
 }
 
 fn linux_distro() -> Option<String> {
-    match sys_info::linux_os_release() {
-        Ok(release) => release.id,
-        _ => None,
-    }
+    crate::platform::linux_os_release().map(|release| release.id.clone())
 }
 
 #[cfg(target_os = "linux")]
@@ -716,8 +825,21 @@ fn linux_glibc_version() -> Option<(u32, u32)> {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[cfg_attr(windows, allow(dead_code))]
 fn linux_glibc_version() -> Option<(u32, u32)> {
     None
+}
+
+/// Split a colon-separated string into a set, filtering empty segments.
+/// Empty segments arise from empty strings, leading/trailing colons, or
+/// consecutive colons — all of which should be ignored rather than
+/// injected as empty paths into config discovery.
+fn split_colon_list(value: &str) -> IndexSet<String> {
+    value
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
 }
 
 fn filename(path: &str) -> &str {
@@ -768,6 +890,16 @@ pub fn vars_safe() -> impl Iterator<Item = (String, String)> {
     })
 }
 
+/// Safe wrapper around std::env::args() that handles invalid UTF-8 gracefully.
+/// std::env::args() panics if any argument contains invalid UTF-8; this uses
+/// args_os() and lossily converts each argument (invalid sequences become U+FFFD).
+/// Unlike vars_safe() the conversion is lossy rather than skipping, so argument
+/// positions are preserved and a malformed argv yields a normal "unknown command"
+/// error instead of crashing.
+pub fn args_safe() -> Vec<String> {
+    args_os().map(|a| a.to_string_lossy().to_string()).collect()
+}
+
 pub fn set_current_dir<P: AsRef<Path>>(path: P) -> Result<()> {
     let path = path.as_ref();
     trace!("cd {}", display_path(path));
@@ -814,6 +946,92 @@ mod tests {
             PathBuf::from("/foo/bar")
         );
         remove_var("MISE_TEST_PATH");
+    }
+
+    #[test]
+    fn test_auto_env_default_for_version() {
+        let v = |s: &str| versions::Versioning::new(s).unwrap();
+        assert!(!auto_env_default_for_version(&v("2026.6.2")));
+        assert!(!auto_env_default_for_version(&v("2026.12.0")));
+        assert!(!auto_env_default_for_version(&v("2027.5.9")));
+        assert!(auto_env_default_for_version(&v("2027.6.0")));
+        assert!(auto_env_default_for_version(&v("2028.1.0")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_platform_env_names_unix() {
+        let names = platform_env_names();
+        assert_eq!(names.len(), 3);
+        assert_eq!(names[0], "unix");
+        assert_eq!(names[1], *crate::cli::version::OS);
+        assert_eq!(
+            names[2],
+            format!(
+                "{}-{}",
+                *crate::cli::version::OS,
+                *crate::cli::version::ARCH
+            )
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_platform_env_names_windows() {
+        // os family == os on windows, so the list dedupes to two entries
+        let names = platform_env_names();
+        assert_eq!(
+            names,
+            vec![
+                "windows".to_string(),
+                format!("windows-{}", *crate::cli::version::ARCH)
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_path_key_from_env_uses_uppercase_path_on_unix() {
+        assert_eq!(
+            path_key_from_env(vec!["path".into(), "HOME".into()]),
+            "PATH"
+        );
+        assert_eq!(
+            path_key_from_env(vec!["Path".into(), "HOME".into()]),
+            "PATH"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_path_key_from_env_preserves_windows_path_casing() {
+        assert_eq!(
+            path_key_from_env(vec!["Path".into(), "TEMP".into()]),
+            "Path"
+        );
+        assert_eq!(
+            path_key_from_env(vec!["TEMP".into(), "PATH".into()]),
+            "PATH"
+        );
+        assert_eq!(path_key_from_env(vec!["TEMP".into()]), "PATH");
+    }
+
+    #[test]
+    fn test_split_colon_list() {
+        let cases: Vec<(&str, Vec<&str>)> = vec![
+            ("", vec![]),    // empty string — was causing panic
+            (":", vec![]),   // colon only
+            (":::", vec![]), // multiple colons
+            ("mise.toml", vec!["mise.toml"]),
+            ("a:b", vec!["a", "b"]),
+            (":a:b:", vec!["a", "b"]), // leading/trailing colons
+            ("a::b", vec!["a", "b"]),  // consecutive colons
+        ];
+        for (input, expected) in cases {
+            let result = split_colon_list(input);
+            let expected: IndexSet<String> = expected.into_iter().map(|s| s.to_string()).collect();
+            assert_eq!(result, expected, "input: {input:?}");
+        }
     }
 
     #[test]

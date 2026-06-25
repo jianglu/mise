@@ -10,7 +10,7 @@ use eyre::Result;
 use flate2::Compression;
 use flate2::write::{ZlibDecoder, ZlibEncoder};
 use itertools::Itertools;
-use serde_derive::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DirenvDiff {
@@ -22,6 +22,12 @@ pub struct DirenvDiff {
 
 impl DirenvDiff {
     pub fn parse(input: &str) -> Result<DirenvDiff> {
+        if input.is_empty() {
+            return Ok(DirenvDiff {
+                old: HashMap::new(),
+                new: HashMap::new(),
+            });
+        }
         // let bytes = BASE64_URL_SAFE.decode(input)?;
         // let uncompressed = inflate_bytes_zlib(&bytes).unwrap();
         // Ok(serde_json::from_slice(&uncompressed[..])?)

@@ -53,7 +53,7 @@ with an SDK version, mise will automatically use it:
 Enable idiomatic version file support:
 
 ```sh
-mise settings set idiomatic_version_file_enable_tools dotnet
+mise settings set idiomatic_version_file_enable_tools=dotnet
 ```
 
 ## Isolated Mode
@@ -65,7 +65,7 @@ If you prefer the traditional mise approach where each version gets its own dire
 isolated mode:
 
 ```sh
-mise settings set dotnet.isolated true
+mise settings set dotnet.isolated=true
 ```
 
 In isolated mode each SDK version is installed under `~/.local/share/mise/installs/dotnet/<version>/`,
@@ -77,6 +77,57 @@ version.
 | `dotnet --list-sdks` | All installed versions | Active version only          |
 | Install location     | `DOTNET_ROOT`          | `installs/dotnet/<version>/` |
 | Multi-targeting      | Works out of the box   | Requires switching versions  |
+
+## Runtime-only Installs
+
+By default, mise installs the full .NET SDK. If you only need to _run_ .NET applications without building them and without the added overhead of the SDK, you can install just the runtime using the `runtime` inline option:
+
+```sh
+mise use dotnet[runtime=dotnet]@8.0.14
+dotnet --list-runtimes
+```
+
+### Valid runtime values
+
+| Value          | Framework                    | Use case                 |
+| -------------- | ---------------------------- | ------------------------ |
+| dotnet         | Microsoft.NETCore.App        | Console apps, libraries  |
+| aspnetcore     | Microsoft.AspNetCore.App     | ASP.NET Core web apps    |
+| windowsdesktop | Microsoft.WindowsDesktop.App | WPF / WinForms (Windows) |
+
+### Example: mix SDK and runtime
+
+You can install a full SDK for development alongside a runtime for a production-like environment:
+
+```toml
+[tools]
+dotnet = ["9", { version = "8.0.14", runtime = "dotnet" }]
+```
+
+::: warning
+
+- **Version numbers are runtime versions**, not SDK versions. For example, `8.0.14` refers to .NET Runtime 8.0.14, not SDK 8.0.14. Check the [.NET release notes](https://github.com/dotnet/core/tree/main/release-notes) for available runtime versions.
+- Runtime-only installs do **not** include the SDK build tools. Commands like `dotnet build` and `dotnet publish` will not be available, and `dotnet --version` will not report an SDK version.
+
+:::
+
+::: tip
+Only exact runtime versions are supported (e.g., `dotnet[runtime=dotnet]@8.0.14`). Channel syntax like `@8` is not currently supported for runtime installs, as it resolves against SDK versions rather than runtime versions.
+:::
+
+## Tool Options
+
+The following [tool-options](/dev-tools/#tool-options) are available for the `dotnet` backend.
+These options go in the `[tools]` section in `mise.toml`.
+
+### `install_env`
+
+Set environment variables for the .NET install script and install-time verification commands:
+
+```toml
+[tools]
+dotnet = { version = "latest", install_env = { DOTNET_CLI_TELEMETRY_OPTOUT = "1" } }
+```
 
 ## Environment Variables
 

@@ -1,7 +1,9 @@
 # asdf Backend
 
 ::: warning
-asdf plugins are considered legacy. For new tools, prefer [vfox plugins](/dev-tools/backends/vfox.html) which are written in Lua, work cross-platform (including Windows), and have access to built-in modules for HTTP, JSON, HTML parsing, and more.
+asdf plugins are considered legacy. **New asdf and vfox plugins are not accepted into the [mise registry](https://github.com/jdx/mise/blob/main/registry/) for supply-chain security reasons** — for registry submissions use the [aqua](/dev-tools/backends/aqua.html) (preferred) or [github](/dev-tools/backends/github.html) backend instead.
+
+If you are writing a private/custom plugin (not for registry submission), prefer [vfox plugins](/dev-tools/backends/vfox.html) over asdf — they're written in Lua, work cross-platform (including Windows), and have access to built-in modules for HTTP, JSON, HTML parsing, and more.
 :::
 
 `asdf` is the original backend for mise.
@@ -50,3 +52,17 @@ need to set env vars other than `PATH`.
 ## Writing asdf (legacy) plugins for mise
 
 See the asdf documentation for more information on [writing plugins](https://asdf-vm.com/plugins/create.html).
+
+## Tool Options
+
+The following [tool-options](/dev-tools/#tool-options) are available for the `asdf` backend—these
+go in `[tools]` in `mise.toml`.
+
+### `install_env`
+
+Set environment variables for asdf plugin install scripts:
+
+```toml
+[tools]
+"asdf:owner/plugin" = { version = "latest", install_env = { MAKEFLAGS = "-j8" } }
+```

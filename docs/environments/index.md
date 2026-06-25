@@ -1,8 +1,7 @@
 # Environments
 
-> Like [direnv](https://github.com/direnv/direnv) it
-> manages _environment variables_ for
-> different project directories.
+> Load the right _environment variables_ automatically for each project
+> directory.
 
 Use mise to specify environment variables used for different projects.
 
@@ -19,6 +18,16 @@ To clear an env var, set it to `false`:
 [env]
 NODE_ENV = false # unset a previously set NODE_ENV
 ```
+
+To set a fallback while preserving an existing non-empty value, use `default`:
+
+```toml [mise.toml]
+[env]
+NODE_ENV = { default = "development" }
+```
+
+This keeps `NODE_ENV` if it was already set before mise ran or by an earlier config file. If it is unset or empty, mise sets it to `"development"`.
+Defaults can be strings or integers.
 
 You can also use the CLI to get/set env vars:
 
@@ -46,14 +55,14 @@ Environment variables are available when using [`mise x|exec`](/cli/exec.html), 
 
 ```shell
 mise set MY_VAR=123
-mise exec -- echo $MY_VAR
+mise exec -- bash -c 'echo $MY_VAR'
 # 123
 ```
 
 You can of course combine them with [tools](/dev-tools/):
 
 ```sh
-mise use node@24
+mise use node@26
 mise set MY_VAR=123
 cat mise.toml
 # [tools]
@@ -81,7 +90,7 @@ If you are using [`shims`](/dev-tools/shims.html), the environment variables wil
 
 ```shell
 mise set NODE_ENV=production
-mise use node@24
+mise use node@26
 # using the absolute path for the example
 ~/.local/share/mise/shims/node --eval 'console.log(process.env.NODE_ENV)'
 ```
@@ -315,15 +324,20 @@ TOML table for the configuration of these directives.
 
 In `mise.toml`: `env._.file` can be used to specify a [dotenv](https://dotenv.org) file to load.
 
+::: warning
+Top-level `env_file`, `dotenv`, and `env_path` are deprecated. Use `env._.file` and
+`env._.path` instead. These keys will be removed in mise 2027.4.0.
+:::
+
 ```toml
 [env]
 _.file = '.env'
 ```
 
 ::: info
-This uses [dotenvy](https://crates.io/crates/dotenvy) under the hood. If you have problems with
-the way `env._.file` works, you will likely need to post an issue there,
-not to mise since there is not much mise can do about the way that crate works.
+Only dotenv-format files use [dotenvy](https://crates.io/crates/dotenvy) under the hood. If you have
+problems with dotenv parsing, you will likely need to post an issue there, not to mise since there is
+not much mise can do about the way that crate works. JSON, YAML, and TOML files use separate parsers.
 :::
 
 The `env._.file` directive supports:
@@ -331,12 +345,17 @@ The `env._.file` directive supports:
 - A single file as a string or an object
 - Multiple files as an array of strings and objects
 - Using relative or absolute paths
-- Using `dotenv`, `json`, or `yaml` file formats
+- Using `dotenv`, `json`, `yaml`, or `toml` file formats
 - The `redact` and `tools` options
 
 ```toml
 [env]
 _.file = '.env.yaml'
+```
+
+```toml
+[env]
+_.file = '.env.toml'
 ```
 
 ```toml
@@ -352,13 +371,15 @@ _.file = [
     '.env.json',
     # Load env from the dotenv file at an absolute path
     '/User/bob/.env',
-    # Load env from the yaml file relative to this config file and redacts the values
+    # Load env from the yaml file relative to this config file and redact the values
     { path = ".secrets.yaml", redact = true }
 ]
 ```
 
-You can set [`MISE_ENV_FILE=.env`](/configuration#mise-env-file) to automatically load dotenv files in any
-directory.
+To automatically load dotenv files from the current directory and parent directories, set
+[`MISE_ENV_FILE=.env`](/configuration#mise-env-file) or `env_file = ".env"` under `[settings]`
+in `~/.config/mise/config.toml`. This is different from `env._.file`, which resolves paths
+relative to the config file that declares it.
 
 See [secrets](/environments/secrets/) for ways to read encrypted files with `env._.file`.
 

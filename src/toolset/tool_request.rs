@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{
     fmt::{Display, Formatter},
     sync::Arc,
@@ -11,9 +11,11 @@ use xx::file;
 
 use crate::backend::platform_target::PlatformTarget;
 use crate::cli::args::BackendArg;
-use crate::config::settings::Settings;
+use crate::config::config_file::config_root;
+use crate::dirs;
 use crate::env;
 use crate::lockfile::LockfileTool;
+use crate::path::PathExt;
 use crate::runtime_symlinks::is_runtime_symlink;
 use crate::toolset::tool_version::ResolveOptions;
 use crate::toolset::{ToolSource, ToolVersion, ToolVersionOptions};
@@ -68,32 +70,47 @@ impl ToolRequest {
             _ => s.to_string(),
         };
         Ok(match s.split_once(':') {
-            Some((ref_type @ ("ref" | "tag" | "branch" | "rev"), r)) => Self::Ref {
-                ref_: r.to_string(),
-                ref_type: ref_type.to_string(),
-                options: backend.opts(),
-                backend,
-                source,
-            },
-            Some(("prefix", p)) => Self::Prefix {
-                prefix: p.to_string(),
-                options: backend.opts(),
-                backend,
-                source,
-            },
-            Some(("path", p)) => Self::Path {
-                path: PathBuf::from(p),
-                options: backend.opts(),
-                backend,
-                source,
-            },
-            Some((p, v)) if p.starts_with("sub-") => Self::Sub {
-                sub: p.split_once('-').unwrap().1.to_string(),
-                options: backend.opts(),
-                orig_version: v.to_string(),
-                backend,
-                source,
-            },
+            Some((ref_type @ ("ref" | "tag" | "branch" | "rev"), r)) => {
+                validate_ref_string(r)?;
+                Self::Ref {
+                    ref_: r.to_string(),
+                    ref_type: ref_type.to_string(),
+                    options: backend.opts(),
+                    backend,
+                    source,
+                }
+            }
+            Some(("prefix", p)) => {
+                validate_version_string(p)?;
+                Self::Prefix {
+                    prefix: p.to_string(),
+                    options: backend.opts(),
+                    backend,
+                    source,
+                }
+            }
+            Some(("path", p)) => {
+                validate_path_string(p)?;
+                let path = resolve_path(p, &source);
+                Self::Path {
+                    path,
+                    options: backend.opts(),
+                    backend,
+                    source,
+                }
+            }
+            Some((p, v)) if p.starts_with("sub-") => {
+                let sub = p.split_once('-').unwrap().1;
+                validate_version_string(sub)?;
+                validate_version_string(v)?;
+                Self::Sub {
+                    sub: sub.to_string(),
+                    options: backend.opts(),
+                    orig_version: v.to_string(),
+                    backend,
+                    source,
+                }
+            }
             None => {
                 if s == "system" {
                     Self::System {
@@ -102,6 +119,7 @@ impl ToolRequest {
                         source,
                     }
                 } else {
+                    validate_version_string(&s)?;
                     Self::Version {
                         version: s,
                         options: backend.opts(),
@@ -190,7 +208,7 @@ impl ToolRequest {
             Self::Ref {
                 ref_: r, ref_type, ..
             } => format!("{ref_type}:{r}"),
-            Self::Path { path: p, .. } => format!("path:{}", p.display()),
+            Self::Path { path: p, .. } => format!("path:{}", p.display_user()),
             Self::Sub {
                 sub, orig_version, ..
             } => format!("sub-{sub}:{orig_version}"),
@@ -313,7 +331,7 @@ impl ToolRequest {
     ) -> Result<Option<LockfileTool>> {
         let request_options = if let Ok(backend) = self.backend() {
             let target = PlatformTarget::from_current();
-            backend.resolve_lockfile_options(self, &target)
+            backend.resolve_lockfile_options(self, &target)?
         } else {
             BTreeMap::new()
         };
@@ -351,34 +369,159 @@ impl ToolRequest {
         config: &Arc<Config>,
         opts: &ResolveOptions,
     ) -> Result<ToolVersion> {
-        // Apply before_date with precedence: CLI flag > per-tool option > global setting.
-        // opts.before_date carries the CLI --before flag (if any).
-        let modified_opts: Option<ResolveOptions> = if opts.before_date.is_none() {
-            if let Some(before) = self.options().get("install_before") {
-                let mut o = opts.clone();
-                o.before_date = Some(crate::duration::parse_into_timestamp(before)?);
-                Some(o)
-            } else if let Some(before) = &Settings::get().install_before {
-                let mut o = opts.clone();
-                o.before_date = Some(crate::duration::parse_into_timestamp(before)?);
-                Some(o)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let opts = modified_opts.as_ref().unwrap_or(opts);
         ToolVersion::resolve(config, self.clone(), opts).await
     }
 
+    pub fn resolve_options(&self, opts: &ResolveOptions) -> Result<ResolveOptions> {
+        let minimum_release_age = self.options().minimum_release_age().map(str::to_string);
+        let mut opts = opts.clone();
+        opts.apply_before_date_for_tool(self.ba(), minimum_release_age.as_deref())?;
+        Ok(opts)
+    }
+
     pub fn is_os_supported(&self) -> bool {
-        if let Some(os) = self.os()
-            && !os.contains(&crate::cli::version::OS)
-        {
-            return false;
+        if let Some(os_list) = self.os() {
+            let current_os = &crate::cli::version::OS;
+            let current_arch = &crate::cli::version::ARCH;
+            let matched = os_list.iter().any(|entry| {
+                if let Some((os, arch)) = entry.split_once('/') {
+                    normalize_os(os) == current_os.as_str()
+                        && normalize_arch(arch) == current_arch.as_str()
+                } else {
+                    normalize_os(entry) == current_os.as_str()
+                }
+            });
+            if !matched {
+                return false;
+            }
         }
         self.ba().is_os_supported()
+    }
+}
+
+/// Reject version strings that contain shell-quote-breaking characters,
+/// control characters, or path-traversal sequences. Version strings flow into
+/// install path names and (for vfox plugins) into `ctx.version` / `ctx.rootPath`
+/// values that downstream Lua hooks often interpolate into shell commands.
+///
+/// The deny list is the minimum set of characters that can break out of either
+/// a single- or double-quoted shell string, or that trigger expansion *inside*
+/// double quotes: quotes themselves, backslash, backtick, and `$`. Plus control
+/// characters (newlines split shell tokens) and `..` (filesystem traversal).
+/// Everything else is allowed so legitimate version vocabulary (npm-style
+/// semver ranges like `>=20 <21 || >=22` or `^1.0.0`, dates, channel names,
+/// `lts/hydrogen`, etc.) continues to work — those characters are only
+/// dangerous in *unquoted* shell context, which cannot occur without one of
+/// the rejected expansion characters appearing first. Leading dashes are also
+/// rejected so backend install tools cannot mistake a version for a CLI flag.
+fn validate_version_string(s: &str) -> Result<()> {
+    if s.is_empty() {
+        return Ok(());
+    }
+    if s.starts_with('-') {
+        bail!("invalid tool version {s:?}: must not start with '-'");
+    }
+    if s.contains("..") {
+        bail!("invalid tool version {s:?}: contains path-traversal sequence");
+    }
+    if let Some(c) = s.chars().find(|c| is_forbidden_version_char(*c)) {
+        bail!("invalid tool version {s:?}: contains forbidden character {c:?}");
+    }
+    Ok(())
+}
+
+/// Validate `ref:`/`branch:`/`tag:`/`rev:` values. Same character rules as
+/// version strings: branch/tag names already use the same broad vocabulary
+/// (`/`, `+`, `-`, etc.), so only shell-quote-breaking characters and leading
+/// dashes need rejection. Kept as a separate function for distinct error
+/// messages.
+fn validate_ref_string(s: &str) -> Result<()> {
+    if s.is_empty() {
+        return Ok(());
+    }
+    if s.starts_with('-') {
+        bail!("invalid tool ref {s:?}: must not start with '-'");
+    }
+    if s.contains("..") {
+        bail!("invalid tool ref {s:?}: contains path-traversal sequence");
+    }
+    if let Some(c) = s.chars().find(|c| is_forbidden_version_char(*c)) {
+        bail!("invalid tool ref {s:?}: contains forbidden character {c:?}");
+    }
+    Ok(())
+}
+
+/// Validate `path:` values. Filesystem paths legitimately contain `/`, spaces,
+/// and many other characters, but the resolved path becomes `ctx.rootPath` /
+/// `installPath` for path-mode tools and is interpolated into shell commands
+/// by some plugin hooks. Reject the same shell-quote-breaking characters as
+/// version strings — `$`, backtick, quotes, and `\` — so a hostile `path:`
+/// entry in a project config cannot inject shell syntax. Path traversal is
+/// intentionally not rejected here because `path:../tools/foo` is a normal
+/// relative-path use case.
+fn validate_path_string(s: &str) -> Result<()> {
+    if s.is_empty() {
+        return Ok(());
+    }
+    if let Some(c) = s.chars().find(|c| {
+        // Allow newlines/tabs/etc. in paths is still bad — keep control-char
+        // and quote/expansion rejection, but allow `/` since paths need it.
+        is_forbidden_version_char(*c)
+    }) {
+        bail!("invalid tool path {s:?}: contains forbidden character {c:?}");
+    }
+    Ok(())
+}
+
+fn is_forbidden_version_char(c: char) -> bool {
+    if (c as u32) < 0x20 || c == '\x7f' {
+        return true;
+    }
+    matches!(c, '"' | '\'' | '`' | '\\' | '$')
+}
+
+/// Resolve a `path:` tool version request value against the config file's directory.
+///
+/// - `~/` is expanded to `$HOME`
+/// - a leading `./` is stripped
+/// - remaining relative paths are joined with `config_root(source)` when the
+///   source is a file-based config; otherwise they fall back to the current
+///   working directory so CLI usage (e.g. `mise use tool@path:./x`) behaves
+///   the way users expect.
+fn resolve_path(p: &str, source: &ToolSource) -> PathBuf {
+    let p = Path::new(p);
+    if let Ok(rest) = p.strip_prefix("~/") {
+        return dirs::HOME.join(rest);
+    }
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    let p = p.strip_prefix("./").unwrap_or(p);
+    let base = match source.path() {
+        Some(src) => config_root::config_root(src),
+        None => dirs::CWD
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from(".")),
+    };
+    base.join(p)
+}
+
+/// Normalize OS name aliases to the canonical form used by `std::env::consts::OS`.
+fn normalize_os(os: &str) -> &str {
+    match os {
+        "darwin" | "macos" => "macos",
+        "windows" | "win" => "windows",
+        other => other,
+    }
+}
+
+/// Normalize architecture name aliases to the canonical form used by `cli::version::ARCH`.
+fn normalize_arch(arch: &str) -> &str {
+    match arch {
+        "x86_64" | "amd64" | "x64" => "x64",
+        "aarch64" | "arm64" => "arm64",
+        other => other,
     }
 }
 
@@ -422,9 +565,138 @@ impl Display for ToolRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::version_sub;
+    use super::{validate_ref_string, validate_version_string, version_sub};
     use pretty_assertions::assert_str_eq;
     use test_log::test;
+
+    #[test]
+    fn test_validate_version_string_accepts_real_versions() {
+        for v in [
+            // concrete versions seen in the wild
+            "1.2.3",
+            "1.2.3-beta",
+            "1.2.3+build",
+            "20240115",
+            "lts/hydrogen",
+            "lts-iron",
+            "latest",
+            "3.12.0a1",
+            "3.2.0-preview1",
+            "tip",
+            "HEAD",
+            "nightly",
+            "1.2.3~rc1",
+            "v1.2.3",
+            "1.20.0-rc.4-otp-29",
+            "29.0-rc3",
+            "2.35.0-beta.01",
+            "stable",
+            "3.16-dev",
+            // npm-style semver range queries (from package.json engines)
+            ">=20.0.0",
+            ">= 25.6.1",
+            "^1.0.0",
+            "~1.2.3",
+            "*",
+            "25.x",
+            ">=20 <21 || >=22",
+            ">=18 <20 || >=22",
+        ] {
+            assert!(
+                validate_version_string(v).is_ok(),
+                "expected {v:?} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_version_string_rejects_metacharacters() {
+        for v in [
+            // quote / expansion characters that break shell context
+            "1.0$(id)",
+            "1.0`id`",
+            "1.0$HOME",
+            "1.0\"x",
+            "1.0'x",
+            "1.0\\x",
+            // backend commands could parse leading dashes as flags
+            "--version",
+            "-v",
+            // control characters / newline splitting
+            "1.0\nrm",
+            "1.0\rrm",
+            "1.0\tx",
+            "1.0\x00x",
+            // path traversal
+            "../etc/passwd",
+            "1.0/../etc",
+        ] {
+            assert!(
+                validate_version_string(v).is_err(),
+                "expected {v:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_ref_string_allows_slash() {
+        assert!(validate_ref_string("feature/foo").is_ok());
+        assert!(validate_ref_string("release/1.2").is_ok());
+        assert!(validate_ref_string("main").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ref_string_rejects_metacharacters() {
+        for v in [
+            "a$(id)",
+            "a..b",
+            "a`b`",
+            "a\"b",
+            "a'b",
+            "a\\b",
+            "--version",
+            "-v",
+        ] {
+            assert!(
+                validate_ref_string(v).is_err(),
+                "expected ref {v:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_path_string() {
+        use super::validate_path_string;
+        // valid paths
+        for p in [
+            "/home/user/tools/foo",
+            "./relative/path",
+            "../parent",
+            "~/tools/bar",
+            "/path with spaces/tool",
+            "C:/Users/foo",
+        ] {
+            assert!(
+                validate_path_string(p).is_ok(),
+                "expected path {p:?} to be accepted"
+            );
+        }
+        // shell-dangerous paths
+        for p in [
+            "/tmp/$HOME",
+            "/tmp/`id`",
+            "/tmp/$(id)",
+            "/tmp/'rm",
+            "/tmp/\"rm",
+            "/tmp/\\rm",
+            "/tmp/\nrm",
+        ] {
+            assert!(
+                validate_path_string(p).is_err(),
+                "expected path {p:?} to be rejected"
+            );
+        }
+    }
 
     #[test]
     fn test_version_sub() {
@@ -442,5 +714,27 @@ mod tests {
         assert_str_eq!(version_sub("0.1.0", "1"), "0");
         assert_str_eq!(version_sub("1.2.3", "0.2.4"), "0");
         assert_str_eq!(version_sub("1.3.3", "0.2.4"), "1.0");
+    }
+
+    #[test]
+    fn test_normalize_os() {
+        use super::normalize_os;
+        assert_eq!(normalize_os("macos"), "macos");
+        assert_eq!(normalize_os("darwin"), "macos");
+        assert_eq!(normalize_os("linux"), "linux");
+        assert_eq!(normalize_os("windows"), "windows");
+        assert_eq!(normalize_os("win"), "windows");
+        assert_eq!(normalize_os("freebsd"), "freebsd");
+    }
+
+    #[test]
+    fn test_normalize_arch() {
+        use super::normalize_arch;
+        assert_eq!(normalize_arch("arm64"), "arm64");
+        assert_eq!(normalize_arch("aarch64"), "arm64");
+        assert_eq!(normalize_arch("x64"), "x64");
+        assert_eq!(normalize_arch("x86_64"), "x64");
+        assert_eq!(normalize_arch("amd64"), "x64");
+        assert_eq!(normalize_arch("riscv64"), "riscv64");
     }
 }

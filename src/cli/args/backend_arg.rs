@@ -4,7 +4,9 @@ use crate::config::Config;
 use crate::plugins::PluginType;
 use crate::registry::REGISTRY;
 use crate::toolset::install_state::InstallStateTool;
-use crate::toolset::{EPHEMERAL_OPT_KEYS, ToolVersionOptions, install_state, parse_tool_options};
+use crate::toolset::{
+    ToolOptionSource, ToolVersionOptions, install_state, parse_tool_options, try_parse_tool_options,
+};
 use crate::{backend, config, dirs, lockfile, registry};
 use contracts::requires;
 use eyre::{Result, bail};
@@ -14,7 +16,7 @@ use std::env;
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
 use std::path::PathBuf;
-use xx::regex;
+use std::str::FromStr;
 
 /// Metadata about how a backend was resolved.
 /// This struct is designed for extensibility - additional fields can be added
@@ -48,6 +50,7 @@ pub struct BackendArg {
     /// ~/.local/share/mise/downloads/<THIS>
     pub downloads_path: PathBuf,
     pub opts: Option<ToolVersionOptions>,
+    opts_source: Option<ToolOptionSource>,
     resolution: BackendResolution,
     // TODO: make this not a hash key anymore to use this
     // backend: OnceCell<ABackend>,
@@ -86,13 +89,16 @@ impl From<InstallStateTool> for BackendArg {
             }
         }
 
+        let opts_source = opts.as_ref().map(|_| ToolOptionSource::InstallManifest);
         let mut tool = Self::new_raw(
             short,
             ist.full,
             tool_name,
-            opts,
+            None,
             BackendResolution::new(ist.explicit_backend),
         );
+        tool.opts = opts;
+        tool.opts_source = opts_source;
         if let Some(installs_path) = ist.installs_path {
             tool.installs_path = installs_path;
         }
@@ -103,14 +109,42 @@ impl From<InstallStateTool> for BackendArg {
 /// Split a string like `"http:hello[url=...,bin=bin]"` into `("http:hello", "url=...,bin=bin")`.
 /// Returns `None` if no bracketed opts are present.
 pub fn split_bracketed_opts(s: &str) -> Option<(&str, &str)> {
-    regex!(r"^(.+)\[(.+)\]$")
-        .captures(s)
-        .map(|c| (c.get(1).unwrap().as_str(), c.get(2).unwrap().as_str()))
+    if !s.ends_with(']') {
+        return None;
+    }
+
+    let mut bracket_start = None;
+    let mut in_single_quotes = false;
+    let mut in_double_quotes = false;
+    let mut escaped = false;
+
+    for (index, ch) in s.char_indices() {
+        match ch {
+            '\'' if !in_double_quotes => in_single_quotes = !in_single_quotes,
+            '"' if !in_single_quotes && !escaped => in_double_quotes = !in_double_quotes,
+            '[' if !in_single_quotes && !in_double_quotes && bracket_start.is_none() => {
+                bracket_start = Some(index);
+            }
+            ']' if !in_single_quotes && !in_double_quotes && index == s.len() - 1 => {
+                if let Some(start) = bracket_start {
+                    return Some((&s[..start], &s[start + 1..index]));
+                }
+                return None;
+            }
+            _ => {}
+        }
+
+        escaped = in_double_quotes && ch == '\\' && !escaped;
+    }
+
+    None
 }
 
 /// Strip trailing `[...]` opts from a string, e.g. `"foo[a=1]"` → `"foo"`.
 pub(crate) fn strip_opts(s: &str) -> String {
-    regex!(r#"\[.+\]$"#).replace_all(s, "").to_string()
+    split_bracketed_opts(s)
+        .map(|(name, _)| name.to_string())
+        .unwrap_or_else(|| s.to_string())
 }
 
 fn parse_backend_components(
@@ -118,19 +152,34 @@ fn parse_backend_components(
     full: Option<&String>,
 ) -> (String, String, Option<ToolVersionOptions>) {
     let short = unalias_backend(short).to_string();
-    let (_backend, mut tool_name) = full
-        .unwrap_or(&short)
-        .split_once(':')
-        .unwrap_or(("", full.unwrap_or(&short)));
+    let source = full.unwrap_or(&short);
+    let (source, opts) = match split_bracketed_opts(source) {
+        Some((name, opts_str)) => (name, Some(parse_tool_options(opts_str))),
+        None => (source.as_str(), None),
+    };
+    let (_backend, tool_name) = source.split_once(':').unwrap_or(("", source));
     let short = strip_opts(&short);
 
-    let mut opts = None;
-    if let Some((name, opts_str)) = split_bracketed_opts(tool_name) {
-        tool_name = name;
-        opts = Some(parse_tool_options(opts_str));
-    }
-
     (short, tool_name.to_string(), opts)
+}
+
+fn parse_backend_components_fallible(
+    short: &str,
+    full: Option<&String>,
+) -> Result<(String, String, Option<ToolVersionOptions>)> {
+    let short = unalias_backend(short).to_string();
+    let source = full.unwrap_or(&short);
+    let (source, opts) = match split_bracketed_opts(source) {
+        Some((name, opts_str)) => (
+            name,
+            Some(try_parse_tool_options(opts_str).map_err(|err| eyre::eyre!(err))?),
+        ),
+        None => (source.as_str(), None),
+    };
+    let (_backend, tool_name) = source.split_once(':').unwrap_or(("", source));
+    let short = strip_opts(&short);
+
+    Ok((short, tool_name.to_string(), opts))
 }
 
 impl BackendArg {
@@ -149,6 +198,7 @@ impl BackendArg {
         resolution: BackendResolution,
     ) -> Self {
         let pathname = short.to_kebab_case();
+        let opts_source = opts.as_ref().map(|_| ToolOptionSource::InlineBackendArg);
         Self {
             tool_name,
             short,
@@ -157,6 +207,7 @@ impl BackendArg {
             installs_path: dirs::INSTALLS.join(&pathname),
             downloads_path: dirs::DOWNLOADS.join(&pathname),
             opts,
+            opts_source,
             resolution,
             // backend: Default::default(),
         }
@@ -223,7 +274,7 @@ impl BackendArg {
                 );
             }
 
-            let registry_shorts: Vec<&str> = REGISTRY.keys().copied().collect();
+            let registry_shorts: Vec<&str> = REGISTRY.keys().collect();
             let mut suggestions: Vec<String> =
                 xx::suggest::similar_n_with_threshold(&self.short, &registry_shorts, 3, 0.8)
                     .into_iter()
@@ -284,18 +335,16 @@ impl BackendArg {
         }
 
         let full = self.full();
-        let backend = full.split(':').next().unwrap();
-        if let Ok(backend_type) = backend.parse() {
+        if let Some((backend, _)) = full.split_once(':')
+            && let Ok(backend_type) = backend.parse()
+        {
             return backend_type;
         }
-        if config::is_loaded()
-            && let Some(repo_url) = Config::get_().get_repo_url(&self.short)
-        {
-            return if repo_url.contains("vfox-") {
-                BackendType::Vfox
-            } else {
-                // TODO: maybe something more intelligent?
-                BackendType::Asdf
+        if config::is_loaded() && Config::get_().get_repo_url(&self.short).is_some() {
+            return match install_state::get_plugin_type(&self.short).unwrap_or(PluginType::Asdf) {
+                PluginType::Vfox => BackendType::Vfox,
+                PluginType::VfoxBackend => BackendType::VfoxBackend(self.short.to_string()),
+                PluginType::Asdf => BackendType::Asdf,
             };
         }
         BackendType::Unknown
@@ -306,8 +355,7 @@ impl BackendArg {
 
         // Check for environment variable override first
         // e.g., MISE_BACKENDS_MYTOOLS='github:myorg/mytools'
-        let env_key = format!("MISE_BACKENDS_{}", short.to_shouty_snake_case());
-        if let Ok(env_value) = env::var(&env_key) {
+        if let Some(env_value) = self.env_backend_override() {
             return env_value;
         }
 
@@ -320,7 +368,11 @@ impl BackendArg {
                 return full;
             }
             if let Some(url) = Config::get_().repo_urls.get(short) {
-                return format!("asdf:{url}");
+                return match install_state::get_plugin_type(short).unwrap_or(PluginType::Asdf) {
+                    PluginType::Asdf => format!("asdf:{url}"),
+                    PluginType::Vfox => format!("vfox:{short}"),
+                    PluginType::VfoxBackend => short.to_string(),
+                };
             }
 
             let config = Config::get_();
@@ -391,30 +443,6 @@ impl BackendArg {
         }
     }
 
-    pub fn full_with_opts(&self) -> String {
-        let full = self.full();
-        if split_bracketed_opts(&full).is_some() {
-            return full;
-        }
-        if let Some(opts) = &self.opts {
-            let opts_str = opts
-                .opts
-                .iter()
-                .filter(|(k, _)| !EPHEMERAL_OPT_KEYS.contains(&k.as_str()))
-                .filter_map(|(k, v)| match v {
-                    toml::Value::String(s) => Some(format!("{k}={s}")),
-                    toml::Value::Table(_) | toml::Value::Array(_) => None,
-                    _ => Some(format!("{k}={v}")),
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            if !full.contains(['[', ']']) && !opts_str.is_empty() {
-                return format!("{full}[{opts_str}]");
-            }
-        }
-        full
-    }
-
     pub fn full_without_opts(&self) -> String {
         let full = self.full();
         if let Some((name, _)) = split_bracketed_opts(&full) {
@@ -424,38 +452,93 @@ impl BackendArg {
     }
 
     pub fn opts(&self) -> ToolVersionOptions {
-        // Start with registry options as base (if available)
-        let full = self.full();
-        let mut opts = REGISTRY
+        self.opts_with_layers(self.backend_alias_opts_from_loaded_config(), None)
+    }
+
+    pub fn registry_opts(&self) -> ToolVersionOptions {
+        let full = self.full_without_opts();
+        REGISTRY
             .get(self.short.as_str())
             .map(|rt| rt.backend_options(&full))
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
 
-        // Get user-provided options (from self.opts or from full string)
-        let user_opts = self.opts.clone().unwrap_or_else(|| {
-            if let Some((_, opts_str)) = split_bracketed_opts(&full) {
-                parse_tool_options(opts_str)
-            } else {
-                ToolVersionOptions::default()
-            }
-        });
+    pub fn opts_with_config(&self, config_opts: Option<ToolVersionOptions>) -> ToolVersionOptions {
+        self.opts_with_layers(self.backend_alias_opts_from_loaded_config(), config_opts)
+    }
 
-        // Merge user options on top (user options take precedence)
-        for (k, v) in user_opts.opts {
-            opts.opts.insert(k, v);
+    fn opts_with_layers(
+        &self,
+        alias_opts: Option<ToolVersionOptions>,
+        config_opts: Option<ToolVersionOptions>,
+    ) -> ToolVersionOptions {
+        let mut opts = self.registry_opts();
+        if let Some(manifest_opts) = self.install_manifest_opts() {
+            opts.apply_overrides(manifest_opts);
         }
-        for (k, v) in user_opts.install_env {
-            opts.install_env.insert(k, v);
+        if alias_opts.is_none()
+            && let Some(full_opts) = self.resolved_full_opts()
+        {
+            opts.apply_overrides(&full_opts);
         }
-        if user_opts.os.is_some() {
-            opts.os = user_opts.os;
+        if let Some(alias_opts) = alias_opts {
+            opts.apply_overrides(&alias_opts);
         }
-
+        if let Some(config_opts) = config_opts {
+            opts.apply_overrides(&config_opts);
+        }
+        if let Some(user_opts) = self.explicit_opts() {
+            opts.apply_overrides(user_opts);
+        }
         opts
+    }
+
+    pub fn explicit_opts(&self) -> Option<&ToolVersionOptions> {
+        self.opts
+            .as_ref()
+            .filter(|_| self.opts_source == Some(ToolOptionSource::InlineBackendArg))
+    }
+
+    pub fn install_manifest_opts(&self) -> Option<&ToolVersionOptions> {
+        self.opts
+            .as_ref()
+            .filter(|_| self.opts_source == Some(ToolOptionSource::InstallManifest))
+    }
+
+    pub(crate) fn resolved_full_opts(&self) -> Option<ToolVersionOptions> {
+        let full = self.full();
+        split_bracketed_opts(&full).map(|(_, opts)| parse_tool_options(opts))
+    }
+
+    pub(crate) fn has_env_backend_override(&self) -> bool {
+        self.env_backend_override().is_some()
+    }
+
+    fn env_backend_override(&self) -> Option<String> {
+        let short = unalias_backend(&self.short);
+        let env_key = format!("MISE_BACKENDS_{}", short.to_shouty_snake_case());
+        env::var(&env_key).ok()
+    }
+
+    fn backend_alias_opts_from_loaded_config(&self) -> Option<ToolVersionOptions> {
+        if !config::is_loaded() || self.has_env_backend_override() {
+            return None;
+        }
+        let short = unalias_backend(&self.short);
+        Config::get_()
+            .all_aliases
+            .get(short)
+            .and_then(|alias| alias.backend.as_deref())
+            .and_then(|backend| split_bracketed_opts(backend).map(|(_, opts)| opts))
+            .map(parse_tool_options)
     }
 
     pub fn set_opts(&mut self, opts: Option<ToolVersionOptions>) {
         self.opts = opts;
+        self.opts_source = self
+            .opts
+            .as_ref()
+            .map(|_| ToolOptionSource::InlineBackendArg);
     }
 
     /// Returns true if the user explicitly specified the full backend identifier.
@@ -545,6 +628,27 @@ impl BackendArg {
     }
 }
 
+impl FromStr for BackendArg {
+    type Err = eyre::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let short = unalias_backend(s).to_string();
+        let explicit = if let Some((prefix, _)) = short.split_once(':') {
+            BackendType::guess(prefix) != BackendType::Unknown
+        } else {
+            false
+        };
+        let (short_parsed, tool_name, opts) = parse_backend_components_fallible(&short, None)?;
+        Ok(Self::new_raw(
+            short_parsed,
+            None,
+            tool_name,
+            opts,
+            BackendResolution::new(explicit),
+        ))
+    }
+}
+
 impl Display for BackendArg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.short)
@@ -590,6 +694,7 @@ impl Hash for BackendArg {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use pretty_assertions::{assert_eq, assert_str_eq};
 
     #[tokio::test]
@@ -614,6 +719,7 @@ mod tests {
             asdf("clojure", "asdf:mise-plugins/mise-clojure", "clojure");
         }
         cargo("cargo:eza", "cargo:eza", "eza");
+        t("dotnet-core", "core:dotnet", "dotnet", BackendType::Core);
         // core("node", "node", "node");
         npm("npm:@antfu/ni", "npm:@antfu/ni", "@antfu/ni");
         npm("npm:prettier", "npm:prettier", "prettier");
@@ -622,6 +728,44 @@ mod tests {
             "vfox:version-fox/vfox-nodejs",
             "version-fox/vfox-nodejs",
         );
+    }
+
+    #[tokio::test]
+    async fn test_bare_package_backend_names_are_not_implicit_tools() {
+        let _config = Config::get().await.unwrap();
+
+        for name in ["cargo", "gem"] {
+            let fa: BackendArg = name.into();
+            assert_str_eq!(name, fa.full());
+            assert_eq!(BackendType::Unknown, fa.backend_type());
+        }
+
+        let fa: BackendArg = "cargo:ripgrep".into();
+        assert_eq!(BackendType::Cargo, fa.backend_type());
+
+        let fa: BackendArg = "gem:bashly".into();
+        assert_eq!(BackendType::Gem, fa.backend_type());
+
+        let fa: BackendArg = "npm:npm".into();
+        assert_str_eq!("npm:npm", fa.full());
+        assert_eq!(BackendType::Npm, fa.backend_type());
+    }
+
+    #[tokio::test]
+    async fn test_bare_npm_uses_registry_tool() {
+        let _config = Config::get().await.unwrap();
+
+        let fa: BackendArg = "npm".into();
+        #[cfg(windows)]
+        {
+            assert_str_eq!("npm:npm", fa.full());
+            assert_eq!(BackendType::Npm, fa.backend_type());
+        }
+        #[cfg(not(windows))]
+        {
+            assert_str_eq!("aqua:npm/cli", fa.full());
+            assert_eq!(BackendType::Aqua, fa.backend_type());
+        }
     }
 
     #[tokio::test]
@@ -635,6 +779,7 @@ mod tests {
         };
         t("asdf:node", "asdf-node");
         t("node", "node");
+        t("dotnet-core", "dotnet");
         t("cargo:eza", "cargo-eza");
         t("npm:@antfu/ni", "npm-antfu-ni");
         t("npm:prettier", "npm-prettier");
@@ -681,48 +826,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_full_with_opts_appends_and_filters() {
+    async fn test_split_bracketed_opts_ignores_quoted_brackets() {
         let _config = Config::get().await.unwrap();
 
-        // start with a normal full like "npm:prettier" and attach opts via set_opts
-        let mut fa: BackendArg = "npm:prettier".into();
-        fa.set_opts(Some(parse_tool_options("a=1,install_env=ignored,b=2")));
-        // install_env should be filtered out, remaining order preserved
-        assert_str_eq!("npm:prettier[a=1,b=2]", fa.full_with_opts());
-
-        fa = "http:hello-lock".into();
-        fa.set_opts(Some(parse_tool_options("url=https://mise.jdx.dev/test-fixtures/hello-world-1.0.0.tar.gz,bin_path=hello-world-1.0.0/bin")));
-        // install_env should be filtered out, remaining order preserved
+        assert_eq!(
+            split_bracketed_opts(r#"http:hello-lock[pattern='a"b',bin_path="bin[debug]"]"#),
+            Some(("http:hello-lock", r#"pattern='a"b',bin_path="bin[debug]""#))
+        );
         assert_str_eq!(
-            "http:hello-lock[url=https://mise.jdx.dev/test-fixtures/hello-world-1.0.0.tar.gz,bin_path=hello-world-1.0.0/bin]",
-            fa.full_with_opts()
+            "http:hello-lock",
+            strip_opts(r#"http:hello-lock[pattern='a"b',bin_path="bin[debug]"]"#)
         );
     }
 
     #[tokio::test]
-    async fn test_full_with_opts_preserves_existing_brackets() {
+    async fn test_parse_backend_opts_with_url_value_on_shorthand() {
         let _config = Config::get().await.unwrap();
+        let ba: BackendArg = "tiny[api_url=https://inline.example/api/v3]".into();
 
-        // when the full already contains options brackets, full_with_opts should return it unchanged
-        let mut fa = BackendArg::new_raw(
-            "node".to_string(),
-            Some("node[foo=bar]".to_string()),
-            "node".to_string(),
+        assert_eq!(ba.short, "tiny");
+        assert_eq!(ba.tool_name, "tiny");
+        assert_eq!(
+            ba.opts().get("api_url"),
+            Some("https://inline.example/api/v3")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_backend_opts_core_fields() {
+        let _config = Config::get().await.unwrap();
+        let ba: BackendArg =
+            "pipx:ruff[depends=python,os=linux,install_env.PIPX_HOME=/tmp/pipx]".into();
+        let opts = ba.opts();
+
+        assert_eq!(opts.depends, Some(vec!["python".to_string()]));
+        assert_eq!(opts.os, Some(vec!["linux".to_string()]));
+        assert_eq!(
+            opts.install_env.get("PIPX_HOME").map(String::as_str),
+            Some("/tmp/pipx")
+        );
+        assert!(!opts.opts.contains_key("depends"));
+        assert!(!opts.opts.contains_key("os"));
+        assert!(!opts.opts.contains_key("install_env.PIPX_HOME"));
+    }
+
+    #[test]
+    fn test_parse_backend_opts_rejects_invalid_core_fields() {
+        let err = "pipx:ruff[depends={ name = \"python\" }]"
+            .parse::<BackendArg>()
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("depends must be a string or array")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_opts_with_config_overlays_registry_config_and_inline() {
+        let _config = Config::get().await.unwrap();
+        let ba: BackendArg = "solidity[bin=inline,foo=inline]".into();
+        let config_opts = parse_tool_options("bin=config,bar=config");
+
+        let opts = ba.opts_with_config(Some(config_opts));
+
+        assert_eq!(ba.registry_opts().get("bin"), Some("solc"));
+        assert_eq!(opts.get("bin"), Some("inline"));
+        assert_eq!(opts.get("bar"), Some("config"));
+        assert_eq!(opts.get("foo"), Some("inline"));
+    }
+
+    #[tokio::test]
+    async fn test_opts_with_layers_preserves_alias_options() {
+        let _config = Config::get().await.unwrap();
+        let ba: BackendArg = "solidity[bin=inline,foo=inline]".into();
+        let alias_opts = parse_tool_options("bin=alias,alias_only=alias");
+        let config_opts = parse_tool_options("bin=config,config_only=config");
+
+        let opts = ba.opts_with_layers(Some(alias_opts), Some(config_opts));
+
+        assert_eq!(ba.registry_opts().get("bin"), Some("solc"));
+        assert_eq!(opts.get("bin"), Some("inline"));
+        assert_eq!(opts.get("alias_only"), Some("alias"));
+        assert_eq!(opts.get("config_only"), Some("config"));
+        assert_eq!(opts.get("foo"), Some("inline"));
+    }
+
+    #[test]
+    fn test_opts_include_resolved_full_bracket_options() {
+        let ba = BackendArg::new_raw(
+            "solidity".to_string(),
+            Some("github:ethereum/solidity[foo=resolved]".to_string()),
+            "ethereum/solidity".to_string(),
             None,
             BackendResolution::new(true),
         );
-        assert_str_eq!("node[foo=bar]", fa.full_with_opts());
 
-        fa = BackendArg::new_raw(
-            "gitlab:jdxcode/mise-test-fixtures".to_string(),
-            Some("gitlab:jdxcode/mise-test-fixtures[asset_pattern=hello-world-1.0.0.tar.gz,bin_path=hello-world-1.0.0/bin]".to_string()),
-            "gitlab:jdxcode/mise-test-fixtures".to_string(),
-            None,
-            BackendResolution::new(true),
-        );
-        assert_str_eq!(
-            "gitlab:jdxcode/mise-test-fixtures[asset_pattern=hello-world-1.0.0.tar.gz,bin_path=hello-world-1.0.0/bin]",
-            fa.full_with_opts()
-        );
+        let opts = ba.opts();
+
+        assert_eq!(ba.registry_opts().get("bin"), Some("solc"));
+        assert_eq!(opts.get("bin"), Some("solc"));
+        assert_eq!(opts.get("foo"), Some("resolved"));
     }
 }

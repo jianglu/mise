@@ -16,12 +16,12 @@ use crate::plugins::PluginType;
 use crate::toolset::Toolset;
 use crate::toolset::helpers::show_python_install_hint;
 use crate::toolset::install_options::InstallOptions;
-use crate::toolset::tool_deps::ToolDeps;
+use crate::toolset::tool_deps::{ToolDeps, tool_key};
 use crate::toolset::tool_request::ToolRequest;
 use crate::toolset::tool_source::ToolSource;
-use crate::toolset::tool_version::ToolVersion;
+use crate::toolset::tool_version::{ResolveOptions, ToolVersion};
 use crate::ui::multi_progress_report::MultiProgressReport;
-use crate::{config, hooks};
+use crate::{backend, config, hooks};
 
 impl Toolset {
     #[async_backtrace::framed]
@@ -59,7 +59,13 @@ impl Toolset {
         let installed = self.install_all_versions(config, versions, opts).await?;
         if !installed.is_empty() {
             let ts = config.get_toolset().await?;
-            config::rebuild_shims_and_runtime_symlinks(config, ts, &installed).await?;
+            config::rebuild_shims_and_runtime_symlinks(
+                config,
+                ts,
+                &installed,
+                crate::lockfile::LockfileUpdateMode::Normal,
+            )
+            .await?;
             // Re-check what's still missing after installation
             let still_missing = self.list_missing_versions(config).await;
             return Ok((installed, still_missing));
@@ -81,12 +87,12 @@ impl Toolset {
                 // Use config request options if available, falling back to backend arg opts.
                 // This ensures tool options like postinstall from mise.toml are preserved
                 // when installing with an explicit CLI version (e.g. `mise install tool@latest`).
-                let options = tvl
+                let config_options = tvl
                     .requests
                     .first()
                     .map(|r| r.options())
-                    .filter(|opts| !opts.is_empty())
-                    .unwrap_or_else(|| tvl.backend.opts());
+                    .filter(|opts| !opts.is_empty());
+                let options = tr.ba().opts_with_config(config_options);
                 if tr.options().is_empty() || tr.options() != options {
                     tr.set_options(options);
                 }
@@ -128,30 +134,38 @@ impl Toolset {
         self.init_request_options(&mut versions);
         show_python_install_hint(&versions);
 
+        let mut disabled_backend_errors = vec![];
+        versions.retain(|tr| {
+            if let Ok(backend) = tr.backend()
+                && let Err(err) = backend::ensure_backend_enabled(&backend.get_type())
+            {
+                disabled_backend_errors.push((tr.clone(), err));
+                false
+            } else {
+                true
+            }
+        });
+
         // Ensure plugins are installed before building dependency graph
         let plugin_errors = self.ensure_plugins_installed(config, &versions, opts).await;
 
         // Filter out tools with plugin errors
         let tools_with_plugin_errors: HashSet<_> =
             plugin_errors.iter().map(|(tr, _)| tr.clone()).collect();
-        let versions_to_install: Vec<_> = versions
-            .into_iter()
-            .filter(|tr| !tools_with_plugin_errors.contains(tr))
-            .collect();
+        versions.retain(|tr| !tools_with_plugin_errors.contains(tr));
 
         // Build dependency graph and install using Kahn's algorithm
-        let (installed, failed) = self
-            .install_with_deps(config, versions_to_install, opts)
-            .await;
+        let (installed, failed) = self.install_with_deps(config, versions, opts).await;
 
-        // Update footer for plugin errors
-        let plugin_error_count = plugin_errors.len();
-        if plugin_error_count > 0 {
-            mpr.footer_inc(plugin_error_count);
+        // Update footer for errors found before install tasks are spawned.
+        let pre_install_error_count = disabled_backend_errors.len() + plugin_errors.len();
+        if pre_install_error_count > 0 {
+            mpr.footer_inc(pre_install_error_count);
         }
 
         // Combine plugin errors with installation failures
-        let mut all_failed = plugin_errors;
+        let mut all_failed = disabled_backend_errors;
+        all_failed.extend(plugin_errors);
         all_failed.extend(failed);
 
         // Skip config reload and resolve in dry-run mode
@@ -296,7 +310,7 @@ impl Toolset {
         let request_order: HashMap<String, usize> = versions
             .iter()
             .enumerate()
-            .map(|(i, tr)| (format!("{}@{}", tr.ba().full(), tr.version()), i))
+            .map(|(i, tr)| (tool_key(tr), i))
             .collect();
 
         // Build dependency graph
@@ -437,7 +451,7 @@ impl Toolset {
 
         // Sort installed versions by original request order to preserve user's intended ordering
         installed.sort_by_key(|tv| {
-            let key = format!("{}@{}", tv.ba().full(), tv.request.version());
+            let key = tool_key(&tv.request);
             request_order.get(&key).copied().unwrap_or(usize::MAX)
         });
 
@@ -452,13 +466,18 @@ impl Toolset {
         opts: &Arc<InstallOptions>,
     ) -> Result<ToolVersion> {
         let mpr = MultiProgressReport::get();
-
-        let mut tv = tr.resolve(config, &opts.resolve_options).await?;
+        let backend = tr.backend()?;
+        backend::ensure_backend_enabled(&backend.get_type())?;
+        let mut resolve_options = opts.resolve_options.clone();
+        if should_refresh_remote_versions(tr, &backend, &resolve_options) {
+            resolve_options.refresh_remote_versions = true;
+        }
+        let mut tv = tr.resolve(config, &resolve_options).await?;
         if let Some(dir) = &opts.install_dir {
             let tool_dir_name = tv.ba().tool_dir_name();
             tv.install_path = Some(dir.join(tool_dir_name).join(tv.tv_pathname()));
         }
-        let backend = tr.backend()?;
+        let before_date = transitive_dependency_before_date(tr, &tv);
 
         let ctx = InstallContext {
             config: config.clone(),
@@ -467,6 +486,7 @@ impl Toolset {
             force: opts.force,
             dry_run: opts.dry_run,
             locked: opts.locked,
+            before_date,
         };
 
         backend.install_version(ctx, tv).await
@@ -532,7 +552,13 @@ impl Toolset {
                     .await?;
                 if !versions.is_empty() {
                     let ts = config.get_toolset().await?;
-                    config::rebuild_shims_and_runtime_symlinks(config, ts, &versions).await?;
+                    config::rebuild_shims_and_runtime_symlinks(
+                        config,
+                        ts,
+                        &versions,
+                        crate::lockfile::LockfileUpdateMode::Normal,
+                    )
+                    .await?;
                 }
                 return Ok(Some(versions));
             }
@@ -551,8 +577,8 @@ impl Toolset {
 
         let mpr = MultiProgressReport::get();
 
-        for (plugin_key, url) in &config.repo_urls {
-            let (plugin_type, name) = Self::parse_plugin_key(plugin_key, url);
+        for plugin_key in config.repo_urls.keys() {
+            let (plugin_type, name) = Self::parse_plugin_key(plugin_key);
 
             // Skip empty plugin names (e.g., from malformed keys like "" or "vfox:")
             if name.is_empty() {
@@ -571,18 +597,54 @@ impl Toolset {
         Ok(())
     }
 
-    fn parse_plugin_key<'a>(key: &'a str, url: &str) -> (PluginType, &'a str) {
-        if let Some(name) = key.strip_prefix("vfox:") {
-            (PluginType::Vfox, name)
-        } else if let Some(name) = key.strip_prefix("vfox-backend:") {
-            (PluginType::VfoxBackend, name)
-        } else if let Some(name) = key.strip_prefix("asdf:") {
-            (PluginType::Asdf, name)
-        } else if url.contains("vfox-") {
-            // Match existing behavior from config/mod.rs:226-228
-            (PluginType::Vfox, key)
-        } else {
-            (PluginType::Asdf, key)
+    fn parse_plugin_key(key: &str) -> (PluginType, &str) {
+        PluginType::from_plugin_config(key)
+    }
+}
+
+/// Whether install-time resolution should refresh the remote-versions cache
+/// before picking a version. Only selectors whose meaning depends on the
+/// freshest upstream entry benefit: `latest`, `sub-N:latest`, and prefix
+/// queries that have no matching installed version. Fully-pinned exact
+/// versions, refs, paths, `system`, and prefix queries already satisfied by
+/// an installed version are unaffected by cache staleness — for those the
+/// cached answer is either correct or harmless, and refreshing is wasted
+/// network traffic. Users who want to pull the absolute latest matching a
+/// prefix can run `mise upgrade` or pin to `@latest`.
+///
+/// Skipped in `prefer_offline` mode (shims, hook-env, activate, etc.) because
+/// the versions host is disabled there, so a refresh would bypass the
+/// on-disk cache populated by an earlier non-prefer-offline command and fall
+/// through to a backend listing that often has far fewer versions (e.g. the
+/// GitHub releases listing only returns the most recent ~30), turning a
+/// previously-resolvable prefix query into "no versions found".
+fn should_refresh_remote_versions(
+    tr: &ToolRequest,
+    backend: &crate::backend::ABackend,
+    opts: &ResolveOptions,
+) -> bool {
+    if opts.refresh_remote_versions || opts.offline || Settings::get().prefer_offline() {
+        return false;
+    }
+    match tr {
+        ToolRequest::Version { version, .. } => version == "latest",
+        ToolRequest::Prefix { prefix, .. } => {
+            backend.list_installed_versions_matching(prefix).is_empty()
         }
+        ToolRequest::Sub { orig_version, .. } => orig_version == "latest",
+        ToolRequest::Ref { .. } | ToolRequest::Path { .. } | ToolRequest::System { .. } => false,
+    }
+}
+
+fn transitive_dependency_before_date(
+    tr: &ToolRequest,
+    tv: &ToolVersion,
+) -> Option<jiff::Timestamp> {
+    match tr {
+        ToolRequest::Version { version, .. } if version != "latest" && version == &tv.version => {
+            None
+        }
+        ToolRequest::Ref { .. } | ToolRequest::Path { .. } | ToolRequest::System { .. } => None,
+        _ => tv.before_date,
     }
 }

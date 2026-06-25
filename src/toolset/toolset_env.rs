@@ -13,7 +13,21 @@ use crate::path_env::PathEnv;
 use crate::toolset::Toolset;
 use crate::toolset::env_cache::{CachedEnv, compute_settings_hash, get_file_mtime};
 use crate::toolset::tool_request::ToolRequest;
-use crate::{env, parallel, uv};
+use crate::{env, github, parallel, uv};
+
+/// PATH with mise-managed install dirs filtered out. mise re-adds the current
+/// toolset's bin dirs below, so a stale `installs/<tool>/<ver>/bin` left on PATH
+/// (e.g. carried in from a frozen env snapshot) does not outrank the version that
+/// `mise x`/`run`/`env` selects for the whole process tree. Mirrors the hook-env
+/// reactivation filter from #10162. (#10345)
+fn pristine_path_without_install_dirs() -> Vec<PathBuf> {
+    let install_dirs = crate::path_env::mise_install_dirs();
+    env::PATH
+        .iter()
+        .filter(|p| !crate::path_env::is_mise_install_path(p.as_path(), &install_dirs))
+        .cloned()
+        .collect()
+}
 
 impl Toolset {
     pub async fn full_env(&self, config: &Arc<Config>) -> Result<EnvMap> {
@@ -23,7 +37,9 @@ impl Toolset {
     }
 
     /// Like full_env but skips `tools=true` env directives (load_post_env).
-    /// Used for preinstall hooks where tool-dependent env vars aren't available yet.
+    /// Used for preinstall hooks where tool-dependent env vars aren't available yet,
+    /// and for dependency_env where resolving tools=true modules on a partial toolset
+    /// would trigger spurious errors from modules expecting the full PATH.
     pub async fn full_env_without_tools(&self, config: &Arc<Config>) -> Result<EnvMap> {
         let mut env = env::PRISTINE_ENV.clone().into_iter().collect::<EnvMap>();
         env.extend(self.env_with_path_without_tools(config).await?);
@@ -32,10 +48,11 @@ impl Toolset {
 
     /// Like env_with_path but skips `tools=true` env directives.
     /// Used during tool installation where tool-dependent env vars
-    /// may reference tools that aren't installed yet.
+    /// may reference tools that aren't installed yet, and in
+    /// dependency_env to avoid triggering module hooks on a partial PATH.
     pub async fn env_with_path_without_tools(&self, config: &Arc<Config>) -> Result<EnvMap> {
         let (mut env, add_paths) = self.env(config).await?;
-        let mut path_env = PathEnv::from_iter(env::PATH.clone());
+        let mut path_env = PathEnv::from_iter(pristine_path_without_install_dirs());
         for p in config.path_dirs().await?.clone() {
             path_env.add(p);
         }
@@ -53,14 +70,15 @@ impl Toolset {
     pub async fn env_with_path(&self, config: &Arc<Config>) -> Result<EnvMap> {
         // Try to load from cache if enabled
         if CachedEnv::is_enabled()
-            && let Some(cached) = self.try_load_env_cache(config)?
+            && let Some(mut cached) = self.try_load_env_cache(config)?
         {
             trace!("env_cache: using cached environment");
+            github::oauth::inject_token_env(&mut cached);
             return Ok(cached);
         }
 
         let (mut env, env_results) = self.final_env(config).await?;
-        let mut path_env = PathEnv::from_iter(env::PATH.clone());
+        let mut path_env = PathEnv::from_iter(pristine_path_without_install_dirs());
         // Use split paths so we save a cache compatible with env_with_path_and_split
         let (user_paths, tool_paths) = self
             .list_final_paths_split(config, env_results.clone())
@@ -80,6 +98,10 @@ impl Toolset {
             debug!("env_cache: failed to save: {}", e);
         }
 
+        // Inject GitHub OAuth token (if configured) after cache save so the
+        // ephemeral token is never persisted to disk.
+        github::oauth::inject_token_env(&mut env);
+
         Ok(env)
     }
 
@@ -97,11 +119,12 @@ impl Toolset {
             trace!("env_cache: using cached environment with split paths");
             let mut env = cached.env;
             // Reconstruct PATH from cached paths
-            let mut path_env = PathEnv::from_iter(env::PATH.clone());
+            let mut path_env = PathEnv::from_iter(pristine_path_without_install_dirs());
             for p in cached.user_paths.iter().chain(cached.tool_paths.iter()) {
                 path_env.add(p.clone());
             }
             env.insert(PATH_KEY.to_string(), path_env.to_string());
+            github::oauth::inject_token_env(&mut env);
             return Ok((
                 env,
                 cached.user_paths,
@@ -117,7 +140,7 @@ impl Toolset {
             .await?;
 
         // Build PATH
-        let mut path_env = PathEnv::from_iter(env::PATH.clone());
+        let mut path_env = PathEnv::from_iter(pristine_path_without_install_dirs());
         for p in user_paths.iter().chain(tool_paths.iter()) {
             path_env.add(p.clone());
         }
@@ -131,6 +154,10 @@ impl Toolset {
         {
             debug!("env_cache: failed to save: {}", e);
         }
+
+        // Inject GitHub OAuth token (if configured) after cache save so the
+        // ephemeral token is never persisted to disk.
+        github::oauth::inject_token_env(&mut env);
 
         Ok((env, user_paths, tool_paths, env_results.watch_files))
     }
@@ -150,7 +177,7 @@ impl Toolset {
             Some(cached) => {
                 let mut env = cached.env;
                 // Reconstruct PATH from cached paths
-                let mut path_env = PathEnv::from_iter(env::PATH.clone());
+                let mut path_env = PathEnv::from_iter(pristine_path_without_install_dirs());
                 for p in cached.user_paths.into_iter().chain(cached.tool_paths) {
                     path_env.add(p);
                 }
@@ -256,8 +283,23 @@ impl Toolset {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
 
+        // Include the auto-sourced uv venv (uv.lock + .venv) in the key so a venv
+        // dir and a sibling sharing the same config files don't collide on one
+        // cache entry, which would leak the venv across directories.
+        let mut uv_venv_inputs: Vec<(PathBuf, u64)> = Vec::new();
+        if Settings::get().python.uv_venv_auto.should_source()
+            && let Some(uv_root) = uv::uv_root()
+        {
+            let lock = uv_root.join("uv.lock");
+            let venv = uv_root.join(".venv");
+            let lock_mtime = get_file_mtime(&lock).unwrap_or(0);
+            let venv_mtime = get_file_mtime(&venv).unwrap_or(0);
+            uv_venv_inputs.push((lock, lock_mtime));
+            uv_venv_inputs.push((venv, venv_mtime));
+        }
+
         Ok(CachedEnv::compute_cache_key(
-            &[config_files, config_lockfiles].concat(),
+            &[config_files, config_lockfiles, uv_venv_inputs].concat(),
             &tool_versions,
             &settings_hash,
             &base_path,
@@ -334,7 +376,7 @@ impl Toolset {
         let (mut env, add_paths) = self.env(config).await?;
         let mut tera_env = env::PRISTINE_ENV.clone().into_iter().collect::<EnvMap>();
         tera_env.extend(env.clone());
-        let mut path_env = PathEnv::from_iter(env::PATH.clone());
+        let mut path_env = PathEnv::from_iter(pristine_path_without_install_dirs());
 
         for p in config.path_dirs().await?.clone() {
             path_env.add(p);
@@ -349,7 +391,9 @@ impl Toolset {
         let mut ctx = config.tera_ctx.clone();
         ctx.insert("env", &tera_env);
         ctx.insert("tools", &self.build_tools_tera_map(config));
-        let mut env_results = self.load_post_env(config, ctx, &tera_env).await?;
+        let mut env_results = self
+            .load_post_env(config, ctx, &tera_env, ToolsFilter::ToolsOnly)
+            .await?;
 
         // Include watch_files from tools=false plugins so the env cache tracks all
         // plugin watch_files, not just tools=true ones. env_results_cached()
@@ -384,6 +428,7 @@ impl Toolset {
         config: &Arc<Config>,
         ctx: tera::Context,
         env: &EnvMap,
+        tools_filter: ToolsFilter,
     ) -> Result<EnvResults> {
         if Settings::no_env() || Settings::get().no_env.unwrap_or(false) {
             return Ok(EnvResults::default());
@@ -408,7 +453,7 @@ impl Toolset {
             entries,
             EnvResolveOptions {
                 vars: false,
-                tools: ToolsFilter::ToolsOnly,
+                tools: tools_filter,
                 warn_on_missing_required: *WARN_ON_MISSING_REQUIRED_ENV,
             },
         )
@@ -419,5 +464,31 @@ impl Toolset {
             debug!("{env_results:?}");
         }
         Ok(env_results)
+    }
+
+    /// Resolve only `tools = true` `[env]` *value* directives (plain
+    /// `KEY = value` templates such as `{{ tools.python.path }}`) against this
+    /// toolset's currently-installed tools, layered on top of `base_env`, and
+    /// return just those vars. Env *modules* are skipped (see
+    /// [`ToolsFilter::ToolsOnlyVals`]).
+    ///
+    /// Deliberately lean: it builds only the `tools.*` tera map (cheap; no
+    /// `exec_env`) rather than recomputing the full env, so `dependency_env` can
+    /// call it per-install without the cost/recursion of `final_env`. Used so a
+    /// dependent tool's install picks up vars like `CLOUDSDK_PYTHON` during a
+    /// combined `mise install`, mirroring what a re-activated shell exports
+    /// between separate installs. (#10282)
+    pub async fn tool_val_env(&self, config: &Arc<Config>, base_env: &EnvMap) -> Result<EnvMap> {
+        let mut ctx = config.tera_ctx.clone();
+        ctx.insert("env", base_env);
+        ctx.insert("tools", &self.build_tools_tera_map(config));
+        let env_results = self
+            .load_post_env(config, ctx, base_env, ToolsFilter::ToolsOnlyVals)
+            .await?;
+        Ok(env_results
+            .env
+            .into_iter()
+            .map(|(k, (v, _))| (k, v))
+            .collect())
     }
 }

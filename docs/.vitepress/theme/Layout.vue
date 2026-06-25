@@ -10,43 +10,86 @@
       </div>
     </template>
 
-    <!-- Chef logo as the commanding centerpiece -->
+    <!-- Landing hero content from the design handoff -->
     <template #home-hero-info-before>
-      <div class="hero-chef-logo">
-        <img
-          class="chef-logo chef-logo-light"
-          src="/logo-full-light.svg"
-          alt="mise-en-place"
-        />
-        <img
-          class="chef-logo chef-logo-dark"
-          src="/logo-full-dark.svg"
-          alt="mise-en-place"
-        />
+      <div class="hero-copy">
+        <div class="hero-eyebrow">mise · pronounced "meez"</div>
+        <div class="hero-lockup">
+          <img
+            class="chef-logo chef-logo-light"
+            src="/logo-full-light.svg"
+            alt="mise-en-place"
+          />
+          <img
+            class="chef-logo chef-logo-dark"
+            src="/logo-full-dark.svg"
+            alt="mise-en-place"
+          />
+        </div>
+        <h1>Your dev env,<br /><em>already prepped.</em></h1>
+        <p>
+          One tool to manage languages, env vars, and tasks per project,
+          reproducibly.
+        </p>
+        <div class="hero-actions">
+          <a class="action-btn action-btn-brand" href="/getting-started"
+            >Getting Started</a
+          >
+          <a class="action-btn action-btn-alt" href="/demo">Demo</a>
+        </div>
       </div>
     </template>
 
-    <!-- Right column: install + action buttons -->
+    <!-- Right column: terminal-forward proof of the workflow -->
     <template #home-hero-info-after>
       <div class="hero-right">
-        <div class="hero-install">
-          <div class="install-label">Install</div>
-          <div class="install-command" @click="copyInstall">
-            <code>curl https://mise.run | sh</code>
-            <span class="install-copy" :class="{ copied }">
-              {{ copied ? '✓' : '⎘' }}
-            </span>
+        <div class="hero-terminal" aria-label="mise terminal example">
+          <div class="terminal-bar">
+            <span></span>
+            <span></span>
+            <span></span>
+            <strong>~/projects/orders · zsh</strong>
           </div>
-          <div class="install-alt">
-            <a href="/installing-mise.html">More install methods →</a>
+          <div class="terminal-body">
+            <div><span class="prompt">$</span> cd ~/projects/orders</div>
+            <div>
+              <span class="dim"
+                ># mise picks up mise.toml and updates the shell</span
+              >
+            </div>
+            <div><span class="ok">✓</span> node@24 active</div>
+            <div><span class="ok">✓</span> python@3.13 active</div>
+            <div><span class="ok">✓</span> terraform@1 active</div>
+            <div>
+              <span class="ok">✓</span> DATABASE_URL loaded from .env.local
+            </div>
+            <div><span class="prompt">$</span> mise run deploy</div>
+            <div>
+              <span class="key">→</span> running task "deploy" (4 steps)
+            </div>
+            <div>
+              <span class="dim"> build · test · migrate · ship ...</span>
+            </div>
+            <div><span class="ok">✓</span> done in 42.1s</div>
           </div>
         </div>
-        <div class="hero-actions">
-          <a class="action-btn action-btn-brand" href="/getting-started.html">Getting Started</a>
-          <a class="action-btn action-btn-alt" href="/demo.html">Demo</a>
-          <a class="action-btn action-btn-alt" href="/about.html">About</a>
+        <div class="hero-install">
+          <button class="install-command" type="button" @click="copyInstall">
+            <code>curl https://mise.run | sh</code>
+            <span class="install-copy" :class="{ copied }">{{
+              copied ? "copied" : "copy"
+            }}</span>
+          </button>
+          <a class="install-alt" href="/installing-mise"
+            >More install methods</a
+          >
         </div>
       </div>
+    </template>
+
+    <template #layout-bottom>
+      <EndevSponsors />
+      <EndevFooter />
     </template>
   </DefaultTheme.Layout>
 </template>
@@ -54,13 +97,37 @@
 <script setup lang="ts">
 import DefaultTheme from "vitepress/theme";
 import { ref } from "vue";
+import EndevFooter from "./EndevFooter.vue";
+import EndevSponsors from "./EndevSponsors.vue";
 
 const copied = ref(false);
+const installCommand = "curl https://mise.run | sh";
 
-function copyInstall() {
-  navigator.clipboard.writeText("curl https://mise.run | sh");
-  copied.value = true;
-  setTimeout(() => (copied.value = false), 2000);
+async function copyInstall() {
+  if (await copyText(installCommand)) {
+    copied.value = true;
+    setTimeout(() => (copied.value = false), 2000);
+  }
+}
+
+async function copyText(text: string) {
+  try {
+    await navigator.clipboard?.writeText(text);
+    if (navigator.clipboard) return true;
+  } catch {
+    // Fall back to the temporary textarea path below.
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copiedText = document.execCommand("copy");
+  document.body.removeChild(textarea);
+  return copiedText;
 }
 </script>
 
@@ -94,7 +161,7 @@ function copyInstall() {
   height: 600px;
   top: -200px;
   left: -100px;
-  background: radial-gradient(circle, #8B2252 0%, transparent 70%);
+  background: radial-gradient(circle, #8b2252 0%, transparent 70%);
   animation: glowDrift1 12s ease-in-out infinite;
 }
 
@@ -103,7 +170,7 @@ function copyInstall() {
   height: 500px;
   top: -100px;
   right: -80px;
-  background: radial-gradient(circle, #D4A76A 0%, transparent 70%);
+  background: radial-gradient(circle, #d4a76a 0%, transparent 70%);
   animation: glowDrift2 15s ease-in-out infinite;
 }
 
@@ -112,20 +179,22 @@ function copyInstall() {
   height: 400px;
   bottom: -100px;
   left: 30%;
-  background: radial-gradient(circle, #6B7F4E 0%, transparent 70%);
+  background: radial-gradient(circle, #6b7f4e 0%, transparent 70%);
   animation: glowDrift3 18s ease-in-out infinite;
 }
 
 /* Dark mode: brighter, moodier glows */
-.dark .hero-glow { opacity: 0.12; }
+.dark .hero-glow {
+  opacity: 0.12;
+}
 .dark .hero-glow-1 {
-  background: radial-gradient(circle, #C75B7A 0%, transparent 70%);
+  background: radial-gradient(circle, #c75b7a 0%, transparent 70%);
 }
 .dark .hero-glow-2 {
-  background: radial-gradient(circle, #D4A76A 0%, transparent 70%);
+  background: radial-gradient(circle, #d4a76a 0%, transparent 70%);
 }
 .dark .hero-glow-3 {
-  background: radial-gradient(circle, #8FA86E 0%, transparent 70%);
+  background: radial-gradient(circle, #8fa86e 0%, transparent 70%);
 }
 
 /* Subtle film grain texture */
@@ -143,71 +212,32 @@ function copyInstall() {
 }
 
 @keyframes glowDrift1 {
-  0%, 100% { transform: translate(0, 0) scale(1); }
-  50% { transform: translate(40px, 30px) scale(1.1); }
+  0%,
+  100% {
+    transform: translate(0, 0) scale(1);
+  }
+  50% {
+    transform: translate(40px, 30px) scale(1.1);
+  }
 }
 
 @keyframes glowDrift2 {
-  0%, 100% { transform: translate(0, 0) scale(1); }
-  50% { transform: translate(-30px, 40px) scale(1.15); }
+  0%,
+  100% {
+    transform: translate(0, 0) scale(1);
+  }
+  50% {
+    transform: translate(-30px, 40px) scale(1.15);
+  }
 }
 
 @keyframes glowDrift3 {
-  0%, 100% { transform: translate(0, 0) scale(1); }
-  50% { transform: translate(20px, -30px) scale(1.05); }
-}
-
-/* ═══════════════════════════════════════════
-   CHEF LOGO — commanding centerpiece
-   ═══════════════════════════════════════════ */
-.hero-chef-logo {
-  display: flex;
-  justify-content: flex-start;
-  margin-bottom: 12px;
-}
-
-.hero-chef-logo .chef-logo {
-  width: 420px;
-  max-width: 90vw;
-  height: auto;
-  filter: drop-shadow(0 4px 20px rgba(139, 34, 82, 0.15));
-  transition: filter 0.4s ease;
-}
-
-.hero-chef-logo .chef-logo:hover {
-  filter: drop-shadow(0 8px 32px rgba(139, 34, 82, 0.25));
-}
-
-/* Light mode: show light (black) logo, hide dark */
-.hero-chef-logo .chef-logo-dark {
-  display: none;
-}
-
-/* Dark mode: swap logos */
-.dark .hero-chef-logo .chef-logo-light {
-  display: none;
-}
-
-.dark .hero-chef-logo .chef-logo-dark {
-  display: inline;
-}
-
-.dark .hero-chef-logo .chef-logo {
-  filter: drop-shadow(0 4px 24px rgba(199, 91, 122, 0.2));
-}
-
-.dark .hero-chef-logo .chef-logo:hover {
-  filter: drop-shadow(0 8px 40px rgba(199, 91, 122, 0.35));
-}
-
-@keyframes heroLogoIn {
-  from {
-    opacity: 0;
-    transform: translateY(-30px) scale(0.95);
+  0%,
+  100% {
+    transform: translate(0, 0) scale(1);
   }
-  to {
-    opacity: 1;
-    transform: translateY(0) scale(1);
+  50% {
+    transform: translate(20px, -30px) scale(1.05);
   }
 }
 
@@ -219,16 +249,6 @@ function copyInstall() {
   flex-direction: column;
   align-items: flex-start;
   margin-top: 0;
-}
-
-.install-label {
-  font-family: "Roc Grotesk", sans-serif;
-  font-weight: 400;
-  font-size: 0.75rem;
-  letter-spacing: 0.15em;
-  text-transform: uppercase;
-  color: var(--vp-c-text-3);
-  margin-bottom: 8px;
 }
 
 .install-command {
@@ -284,15 +304,12 @@ function copyInstall() {
   margin-top: 10px;
   font-size: 0.85rem;
   font-family: "Roc Grotesk", sans-serif;
-}
-
-.install-alt a {
   color: var(--vp-c-text-3);
   text-decoration: none;
   transition: color 0.2s ease;
 }
 
-.install-alt a:hover {
+.install-alt:hover {
   color: var(--vp-c-brand-1);
 }
 
@@ -311,22 +328,21 @@ function copyInstall() {
    RESPONSIVE
    ═══════════════════════════════════════════ */
 @media (max-width: 768px) {
-  .hero-chef-logo .chef-logo {
-    max-width: 280px;
+  .hero-glow-1 {
+    width: 350px;
+    height: 350px;
   }
-
-  .hero-glow-1 { width: 350px; height: 350px; }
-  .hero-glow-2 { width: 300px; height: 300px; }
-  .hero-glow-3 { width: 250px; height: 250px; }
+  .hero-glow-2 {
+    width: 300px;
+    height: 300px;
+  }
+  .hero-glow-3 {
+    width: 250px;
+    height: 250px;
+  }
 
   .install-command code {
     font-size: 0.85rem;
-  }
-}
-
-@media (max-width: 480px) {
-  .hero-chef-logo .chef-logo {
-    max-width: 220px;
   }
 }
 </style>

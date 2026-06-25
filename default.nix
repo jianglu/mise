@@ -2,7 +2,7 @@
 
 rustPlatform.buildRustPackage {
   pname = "mise";
-  version = "2026.4.2";
+  version = "2026.6.14";
 
   src = lib.cleanSource ./.;
 
@@ -15,6 +15,10 @@ rustPlatform.buildRustPackage {
     clang
     llvmPackages.libclang
     pkg-config
+    rustPlatform.bindgenHook
+  ];
+  nativeCheckInputs = with pkgs; [
+    git
   ];
   buildInputs = with pkgs; [
     bash
@@ -52,7 +56,7 @@ rustPlatform.buildRustPackage {
   '';
 
   meta = with lib; {
-    description = "The front-end to your dev env";
+    description = "Dev tools, env vars, and tasks in one CLI";
     homepage = "https://github.com/jdx/mise";
     license = licenses.mit;
     mainProgram = "mise";

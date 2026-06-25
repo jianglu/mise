@@ -1,10 +1,14 @@
 use crate::backend::backend_type::BackendType;
+use crate::backend::{self, SecurityFeature};
+use crate::cli::args::BackendArg;
 use crate::config::Settings;
 use crate::registry::{REGISTRY, RegistryTool, tool_enabled};
 use crate::ui::table::MiseTable;
 use eyre::{Result, bail};
 use itertools::Itertools;
-use serde_derive::Serialize;
+use serde::Serialize;
+use std::sync::Arc;
+use tokio::{sync::Semaphore, task::JoinSet};
 
 /// List available tools to install
 ///
@@ -32,6 +36,14 @@ pub struct Registry {
     /// Output in JSON format
     #[clap(long, short = 'J')]
     json: bool,
+
+    /// Include security features for each tool's backends in JSON output.
+    ///
+    /// Requires --json. Security info is de-duplicated across
+    /// all of a tool's backends. This can add noticeable time for large
+    /// listings since each backend's security info is resolved individually.
+    #[clap(long, requires = "json")]
+    security: bool,
 }
 
 #[derive(Serialize)]
@@ -42,6 +54,15 @@ struct RegistryToolOutput {
     description: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     aliases: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    security: Vec<SecurityFeature>,
+}
+
+struct RegistryToolOutputArgs {
+    short: String,
+    backends: Vec<String>,
+    description: Option<String>,
+    aliases: Vec<String>,
 }
 
 impl Registry {
@@ -49,7 +70,7 @@ impl Registry {
         if let Some(name) = &self.name {
             if let Some(rt) = REGISTRY.get(name.as_str()) {
                 if self.json {
-                    let tool = self.to_output(name, rt);
+                    let tool = to_output(self.output_args(name, rt), self.security).await;
                     miseprintln!("{}", serde_json::to_string_pretty(&tool)?);
                 } else {
                     miseprintln!("{}", self.filter_backends(rt).join(" "));
@@ -60,7 +81,7 @@ impl Registry {
         } else if self.complete {
             self.complete()?;
         } else if self.json {
-            self.display_json()?;
+            self.display_json().await?;
         } else {
             self.display_table()?;
         }
@@ -78,24 +99,26 @@ impl Registry {
         }
     }
 
-    fn to_output(&self, short: &str, rt: &RegistryTool) -> RegistryToolOutput {
-        RegistryToolOutput {
+    fn output_args(&self, short: &str, rt: &RegistryTool) -> RegistryToolOutputArgs {
+        let backends: Vec<String> = self
+            .filter_backends(rt)
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        RegistryToolOutputArgs {
             short: short.to_string(),
-            backends: self
-                .filter_backends(rt)
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            backends,
             description: rt.description.map(|s| s.to_string()),
             aliases: rt.aliases.iter().map(|s| s.to_string()).collect(),
         }
     }
 
-    fn filtered_tools(&self) -> impl Iterator<Item = (&&'static str, &RegistryTool)> {
+    fn filtered_tools(&self) -> impl Iterator<Item = (&'static str, &'static RegistryTool)> {
+        let hide_aliased = self.hide_aliased;
         REGISTRY
             .iter()
             .filter(|(short, _)| filter_enabled(short))
-            .filter(|(short, rt)| !self.hide_aliased || **short == rt.short)
+            .filter(move |(short, rt)| !hide_aliased || *short == rt.short)
     }
 
     fn display_table(&self) -> Result<()> {
@@ -104,7 +127,6 @@ impl Registry {
             .filtered_tools()
             .map(|(short, rt)| (short.to_string(), self.filter_backends(rt).join(" ")))
             .filter(|(_, backends)| !backends.is_empty())
-            .sorted_by(|(a, _), (b, _)| a.cmp(b))
             .map(|(short, backends)| vec![short, backends])
             .collect_vec();
         for row in data {
@@ -123,7 +145,6 @@ impl Registry {
                         .unwrap_or_default(),
                 )
             })
-            .sorted_by(|(a, _), (b, _)| a.cmp(b))
             .for_each(|(short, description)| {
                 println!(
                     "{}:{}",
@@ -134,15 +155,71 @@ impl Registry {
         Ok(())
     }
 
-    fn display_json(&self) -> Result<()> {
-        let tools: Vec<RegistryToolOutput> = self
+    async fn display_json(&self) -> Result<()> {
+        // Collect owned output args before async work so parallel tasks do not
+        // borrow from the static registry map.
+        let tools: Vec<RegistryToolOutputArgs> = self
             .filtered_tools()
-            .map(|(short, rt)| self.to_output(short, rt))
-            .filter(|tool| !tool.backends.is_empty())
-            .sorted_by(|a, b| a.short.cmp(&b.short))
+            .filter(|(_, rt)| !self.filter_backends(rt).is_empty())
+            .map(|(short, rt)| self.output_args(short, rt))
             .collect();
-        miseprintln!("{}", serde_json::to_string_pretty(&tools)?);
+
+        let mut outputs: Vec<RegistryToolOutput> = Vec::with_capacity(tools.len());
+        if self.security {
+            let semaphore = Arc::new(Semaphore::new(Settings::get().jobs));
+            let mut jset: JoinSet<RegistryToolOutput> = JoinSet::new();
+            for tool in tools {
+                let permit = semaphore.clone().acquire_owned().await?;
+                jset.spawn(async move {
+                    let _permit = permit;
+                    to_output(tool, true).await
+                });
+            }
+            while let Some(result) = jset.join_next().await {
+                outputs.push(result?);
+            }
+            outputs.sort_by(|a, b| a.short.cmp(&b.short));
+        } else {
+            for tool in tools {
+                outputs.push(to_output(tool, false).await);
+            }
+        }
+        miseprintln!("{}", serde_json::to_string_pretty(&outputs)?);
         Ok(())
+    }
+}
+
+/// Resolve and merge security features across every backend for a tool.
+/// Duplicate features (same variant + payload) are collapsed.
+async fn collect_security(backends: &[String]) -> Vec<SecurityFeature> {
+    let mut features: Vec<SecurityFeature> = Vec::new();
+    for full in backends {
+        let ba = BackendArg::from(full.as_str());
+        let Some(backend) = backend::arg_to_backend(ba) else {
+            continue;
+        };
+        for feature in backend.security_info().await {
+            if !features.contains(&feature) {
+                features.push(feature);
+            }
+        }
+    }
+    features
+}
+
+async fn to_output(tool: RegistryToolOutputArgs, security: bool) -> RegistryToolOutput {
+    let security = if security {
+        collect_security(&tool.backends).await
+    } else {
+        vec![]
+    };
+
+    RegistryToolOutput {
+        short: tool.short,
+        backends: tool.backends,
+        description: tool.description,
+        aliases: tool.aliases,
+        security,
     }
 }
 
@@ -160,9 +237,8 @@ static AFTER_LONG_HELP: &str = color_print::cstr!(
 );
 
 fn filter_enabled(short: &str) -> bool {
-    tool_enabled(
-        &Settings::get().enable_tools,
-        &Settings::get().disable_tools,
-        &short.to_string(),
-    )
+    let settings = Settings::get();
+    let enable_tools = settings.enable_tools();
+    let disable_tools = settings.disable_tools();
+    tool_enabled(enable_tools.as_ref(), &disable_tools, &short.to_string())
 }

@@ -3,11 +3,11 @@ use crate::direnv::DirenvDiff;
 use crate::env::{__MISE_DIFF, PATH_KEY, TERM_WIDTH};
 use crate::env::{join_paths, split_paths};
 use crate::env_diff::{EnvDiff, EnvDiffOperation, EnvMap};
-use crate::file::display_rel_path;
+use crate::file::{canonicalize_cached, display_rel_path};
 use crate::hook_env::{PREV_SESSION, WatchFilePattern};
 use crate::shell::{ShellType, get_shell};
-use crate::toolset::Toolset;
-use crate::{env, hook_env, hooks, watch_files};
+use crate::toolset::{ResolveOptions, Toolset, ToolsetBuilder};
+use crate::{env, exit, hook_env, hooks, watch_files};
 use console::truncate_str;
 use eyre::Result;
 use indexmap::IndexSet;
@@ -44,15 +44,40 @@ pub struct HookEnv {
     #[clap(long, hide = true)]
     reason: Option<HookReason>,
 
-    /// Show "mise: <PLUGIN>@<VERSION>" message when changing directories
+    /// Show "mise: <TOOL>@<VERSION>" message when changing directories
     #[clap(long, hide = true)]
     status: bool,
 }
 
 impl HookEnv {
     pub async fn run(self) -> Result<()> {
-        let config = Config::get().await?;
-        let ts = config.get_toolset().await?;
+        let shell = get_shell(self.shell).expect("no shell provided, use `--shell=zsh`");
+        let config = match Config::get().await {
+            Ok(config) => config,
+            Err(err) => {
+                let Some(config_path) = hook_env::untrusted_config_error_path(&err) else {
+                    return Err(err);
+                };
+                if hook_env::should_show_untrusted_config_warning(&config_path) {
+                    if let Err(mark_err) =
+                        hook_env::mark_untrusted_config_warning_seen(&*shell, &config_path)
+                    {
+                        trace!("failed to mark untrusted config warning seen: {mark_err}");
+                    }
+                    return Err(err);
+                }
+                exit(1);
+            }
+        };
+        // Shell activation must stay fast and non-networked; missing tools are
+        // handled by the normal install paths instead of hook-env.
+        let ts = ToolsetBuilder::new()
+            .with_resolve_options(ResolveOptions {
+                offline: true,
+                ..Default::default()
+            })
+            .build(&config)
+            .await?;
         time!("hook-env");
 
         // Try to use cached watch_files for early exit check if env_cache is enabled
@@ -86,7 +111,6 @@ impl HookEnv {
             return Ok(());
         }
         time!("should_exit_early false");
-        let shell = get_shell(self.shell).expect("no shell provided, use `--shell=zsh`");
         miseprint!("{}", hook_env::clear_old_env(&*shell))?;
 
         // Use env_with_path_and_split which handles caching internally
@@ -96,7 +120,7 @@ impl HookEnv {
 
         // Create config_paths from user_paths for display_status and build_session
         let config_paths: IndexSet<PathBuf> = user_paths.iter().cloned().collect();
-        self.display_status(&config, ts, &mise_env, &config_paths)
+        self.display_status(&config, &ts, &mise_env, &config_paths)
             .await?;
 
         let mut diff = EnvDiff::new(&env::PRISTINE_ENV, mise_env.clone());
@@ -142,7 +166,7 @@ impl HookEnv {
         patches.push(
             self.build_session_operation(
                 &config,
-                ts,
+                &ts,
                 mise_env,
                 new_aliases.clone(),
                 watch_files,
@@ -158,6 +182,7 @@ impl HookEnv {
                 "1".into(),
             ));
         }
+        hook_env::clear_untrusted_config_warning(&mut patches);
 
         let output = hook_env::build_env_commands(&*shell, &patches);
         miseprint!("{output}")?;
@@ -167,8 +192,9 @@ impl HookEnv {
             hook_env::build_alias_commands(&*shell, &PREV_SESSION.aliases, &new_aliases);
         miseprint!("{alias_output}")?;
 
-        hooks::run_all_hooks(&config, ts, &*shell).await;
-        watch_files::execute_runs(&config, ts).await;
+        hooks::run_all_hooks(&config, &ts, &*shell).await;
+        hooks::run_enter_hooks_for_newly_loaded_configs(&config, &ts, &*shell).await;
+        watch_files::execute_runs(&config, &ts).await;
 
         Ok(())
     }
@@ -234,7 +260,7 @@ impl HookEnv {
             }
         }
         ts.notify_if_versions_missing(config).await;
-        crate::prepare::notify_if_stale(config);
+        crate::deps::notify_if_stale(config);
         Ok(())
     }
 
@@ -273,6 +299,7 @@ impl HookEnv {
                 let mut orig_reordered = Vec::new();
                 let mut seen_orig = false;
                 let mut seen_in_current: HashSet<&PathBuf> = HashSet::new();
+                let mise_install_dirs = crate::path_env::mise_install_dirs();
                 for path in &current_paths {
                     if orig_set.contains(path) {
                         seen_orig = true;
@@ -283,6 +310,14 @@ impl HookEnv {
 
                     // Skip if it's a mise-managed path from previous session
                     if mise_paths_set.contains(path) {
+                        continue;
+                    }
+
+                    // Paths under mise's installs dir are mise-managed even if
+                    // the previous session diff did not claim them. Preserving a
+                    // stale install path as a user prefix can shadow the active
+                    // version selected by the current toolset.
+                    if crate::path_env::is_mise_install_path(path, &mise_install_dirs) {
                         continue;
                     }
 
@@ -323,12 +358,12 @@ impl HookEnv {
         // Use canonicalized paths for comparison to handle symlinks, relative paths,
         // and other path variants that refer to the same filesystem location.
         let post_canonical: HashSet<PathBuf> =
-            post.iter().filter_map(|p| p.canonicalize().ok()).collect();
+            post.iter().filter_map(|p| canonicalize_cached(p)).collect();
         let user_additions_set: HashSet<_> = pre.iter().chain(post_user.iter()).collect();
         let user_additions_canonical: HashSet<PathBuf> = pre
             .iter()
             .chain(post_user.iter())
-            .filter_map(|p| p.canonicalize().ok())
+            .filter_map(|p| canonicalize_cached(p))
             .collect();
 
         let tool_paths_filtered: Vec<PathBuf> = tool_paths
@@ -342,7 +377,7 @@ impl HookEnv {
                 if post.contains(p) {
                     return false;
                 }
-                if let Ok(canonical) = p.canonicalize()
+                if let Some(canonical) = canonicalize_cached(p)
                     && post_canonical.contains(&canonical)
                 {
                     return false;
@@ -352,7 +387,7 @@ impl HookEnv {
                 if user_additions_set.contains(p) {
                     return false;
                 }
-                if let Ok(canonical) = p.canonicalize()
+                if let Some(canonical) = canonicalize_cached(p)
                     && user_additions_canonical.contains(&canonical)
                 {
                     return false;
@@ -374,7 +409,7 @@ impl HookEnv {
                 if user_additions_set.contains(p) {
                     return false;
                 }
-                if let Ok(canonical) = p.canonicalize()
+                if let Some(canonical) = canonicalize_cached(p)
                     && user_additions_canonical.contains(&canonical)
                 {
                     return false;
@@ -425,20 +460,34 @@ impl HookEnv {
         installs: &[PathBuf],
         to_remove: &[PathBuf],
     ) -> Result<Option<EnvDiffOperation>> {
-        let mut diff = DirenvDiff::parse(input)?;
+        let mut diff = DirenvDiff::parse(input)
+            .inspect_err(|err| debug!("Failed to parse diff, error: '{:?}'", err))?;
         if diff.new_path().is_empty() {
             return Ok(None);
         }
         for path in to_remove {
-            diff.remove_path_from_old_and_new(path)?;
+            diff.remove_path_from_old_and_new(path).inspect_err(|err| {
+                debug!(
+                    "Failed to remove path from diff: '{:?}' path: '{}'",
+                    err,
+                    path.display()
+                )
+            })?;
         }
         for install in installs {
-            diff.add_path_to_old_and_new(install)?;
+            diff.add_path_to_old_and_new(install).inspect_err(|err| {
+                debug!(
+                    "Failed to add path to diff: '{:?}' path: '{}'",
+                    err,
+                    install.display()
+                )
+            })?;
         }
 
         Ok(Some(EnvDiffOperation::Change(
             "DIRENV_DIFF".into(),
-            diff.dump()?,
+            diff.dump()
+                .inspect_err(|err| debug!("Failed to dump diff: '{:?}'", err))?,
         )))
     }
 

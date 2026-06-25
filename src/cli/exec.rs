@@ -12,8 +12,9 @@ use crate::cli::args::ToolArg;
 #[cfg(any(test, windows))]
 use crate::cmd;
 use crate::config::{Config, Settings};
+use crate::deps::{DepsEngine, DepsOptions};
 use crate::env;
-use crate::prepare::{PrepareEngine, PrepareOptions};
+use crate::env_diff::EnvDiff;
 use crate::sandbox::SandboxConfig;
 use crate::toolset::env_cache::CachedEnv;
 use crate::toolset::{InstallOptions, ResolveOptions, ToolsetBuilder};
@@ -48,40 +49,41 @@ pub struct Exec {
     #[clap(long, short, env = "MISE_JOBS", verbatim_doc_comment)]
     pub jobs: Option<usize>,
 
-    /// [experimental] Allow specific env var through (implies --deny-env for everything else)
+    /// Allow specific env var through (implies --deny-env for everything else)
+    /// Supports wildcards, e.g. --allow-env='MYAPP_*'
     #[clap(long, value_name = "VAR", verbatim_doc_comment)]
     pub allow_env: Vec<String>,
 
-    /// [experimental] Allow network to specific host (implies --deny-net for everything else)
+    /// Allow network to specific host (implies --deny-net for everything else)
     /// macOS only in v1; on Linux falls back to allowing all network
     #[clap(long, value_name = "HOST", verbatim_doc_comment)]
     pub allow_net: Vec<String>,
 
-    /// [experimental] Allow reads from specific path (implies --deny-read for everything else)
+    /// Allow reads from specific path (implies --deny-read for everything else)
     #[clap(long, value_name = "PATH", verbatim_doc_comment)]
     pub allow_read: Vec<std::path::PathBuf>,
 
-    /// [experimental] Allow writes to specific path (implies --deny-write for everything else)
+    /// Allow writes to specific path (implies --deny-write for everything else)
     #[clap(long, value_name = "PATH", verbatim_doc_comment)]
     pub allow_write: Vec<std::path::PathBuf>,
 
-    /// [experimental] Block reads, writes, network, and env vars
+    /// Block reads, writes, network, and env vars
     #[clap(long, verbatim_doc_comment)]
     pub deny_all: bool,
 
-    /// [experimental] Block env var inheritance (only PATH, HOME, USER, SHELL, TERM, LANG pass through)
+    /// Block env var inheritance (only PATH, HOME, USER, SHELL, TERM, LANG pass through)
     #[clap(long, verbatim_doc_comment)]
     pub deny_env: bool,
 
-    /// [experimental] Block all network access
+    /// Block all network access
     #[clap(long, verbatim_doc_comment)]
     pub deny_net: bool,
 
-    /// [experimental] Block filesystem reads (system libs and tool dirs still accessible)
+    /// Block filesystem reads (system libs and tool dirs still accessible)
     #[clap(long, verbatim_doc_comment)]
     pub deny_read: bool,
 
-    /// [experimental] Block all filesystem writes
+    /// Block all filesystem writes
     #[clap(long, verbatim_doc_comment)]
     pub deny_write: bool,
 
@@ -91,10 +93,10 @@ pub struct Exec {
 
     /// Skip automatic dependency preparation
     #[clap(long)]
-    pub no_prepare: bool,
+    pub no_deps: bool,
 
-    /// Directly pipe stdin/stdout/stderr from plugin to user
-    /// Sets --jobs=1
+    /// Connect backend install command stdin/stdout/stderr directly to the terminal
+    /// Implies --jobs=1
     #[clap(long, overrides_with = "jobs")]
     pub raw: bool,
 }
@@ -166,11 +168,11 @@ impl Exec {
 
         let mut env = measure!("env_with_path", { ts.env_with_path(&config).await? });
 
-        // Run auto-enabled prepare steps (unless --no-prepare)
-        if !self.no_prepare {
-            let engine = PrepareEngine::new(&config)?;
+        // Run auto-enabled deps steps (unless --no-deps)
+        if !self.no_deps {
+            let engine = DepsEngine::new(&config)?;
             engine
-                .run(PrepareOptions {
+                .run(DepsOptions {
                     auto_only: true, // Only run providers with auto=true
                     env: env.clone(),
                     ..Default::default()
@@ -187,6 +189,28 @@ impl Exec {
         if Settings::get().env_cache && !self.fresh_env {
             let key = CachedEnv::ensure_encryption_key();
             env.insert("__MISE_ENV_CACHE_KEY".to_string(), key);
+        }
+
+        // Embed __MISE_DIFF so a nested mise invocation can recover the pristine
+        // env (and pristine PATH) instead of stacking our tool dirs on top of its
+        // own. Without this, `mise -C <new> exec -- ...` invoked from inside our
+        // child process would inherit our tool dirs as user-pre-PATH and they
+        // would outrank the inner toolset's resolved tool. See discussion #9754.
+        // Computed after all env modifications so the diff fully describes what
+        // mise added (matches task_executor.rs).
+        let removed_mise_env = if !env::MISE_ENV.is_empty() {
+            // Keep explicit -E profiles active if the child shell sources `mise activate`.
+            env.remove("MISE_ENV")
+        } else {
+            None
+        };
+        env.remove("__MISE_DIFF");
+        let serialized = EnvDiff::from_final_env(&env::PRISTINE_ENV, &env).serialize();
+        if let Some(mise_env) = removed_mise_env {
+            env.insert("MISE_ENV".to_string(), mise_env);
+        }
+        if let Ok(serialized) = serialized {
+            env.insert("__MISE_DIFF".to_string(), serialized);
         }
 
         if program.rsplit('/').next() == Some("fish") {
@@ -210,7 +234,7 @@ impl Exec {
             args.insert(0, "-C".into());
         }
 
-        // Build sandbox config from CLI flags (experimental feature)
+        // Build sandbox config from CLI flags.
         let mut sandbox = SandboxConfig {
             deny_read: self.deny_all || self.deny_read,
             deny_write: self.deny_all || self.deny_write,
@@ -223,14 +247,15 @@ impl Exec {
         };
         sandbox.resolve_paths();
 
-        // Check experimental flag if sandbox is being used
         if sandbox.is_active() {
-            Settings::get().ensure_experimental("sandbox")?;
             env = sandbox.filter_env(&env);
         }
 
         time!("exec");
-        exec_program(program, args, env, &sandbox).await
+        // shell_body_mode: true only for the `-c`/`--command` path, where
+        // parse_command synthesized `shell + [flags.., body]`. A positional
+        // command must not be reinterpreted as a shell body.
+        exec_program(program, args, env, &sandbox, self.c.is_some()).await
     }
 }
 
@@ -240,6 +265,7 @@ pub async fn exec_program<T, U>(
     args: U,
     env: BTreeMap<String, String>,
     sandbox: &SandboxConfig,
+    _shell_body_mode: bool,
 ) -> Result<()>
 where
     T: IntoExecutablePath,
@@ -276,7 +302,11 @@ where
             // The child process still inherits the full unmodified PATH.
             let user_shims = &*crate::dirs::SHIMS;
             let sys_shims = crate::env::MISE_SYSTEM_DATA_DIR.join("shims");
-            let is_shims_dir = |p: &std::path::PathBuf| p == user_shims || p == &sys_shims;
+            let is_shims_dir = |p: &std::path::PathBuf| {
+                let expanded = crate::file::replace_path(p);
+                crate::file::paths_eq(&expanded, user_shims)
+                    || crate::file::paths_eq(&expanded, &sys_shims)
+            };
             let pristine: std::collections::HashSet<_> = crate::env::PATH.iter().collect();
             let all_paths: Vec<_> = std::env::split_paths(&OsString::from(path_val)).collect();
             // Mise-added paths first (preserving relative order)
@@ -321,6 +351,7 @@ pub async fn exec_program<T, U>(
     args: U,
     env: BTreeMap<String, String>,
     sandbox: &SandboxConfig,
+    shell_body_mode: bool,
 ) -> Result<()>
 where
     T: IntoExecutablePath,
@@ -338,19 +369,12 @@ where
     // Reorder PATH for program resolution: mise-added paths first, then
     // original system paths (minus shims). See Unix version for full rationale.
     let lookup_path = env.get(&*env::PATH_KEY).map(|path_val| {
-        let shims_normalized = crate::dirs::SHIMS
-            .to_string_lossy()
-            .to_lowercase()
-            .replace('/', "\\");
-        let sys_shims_normalized = crate::env::MISE_SYSTEM_DATA_DIR
-            .join("shims")
-            .to_string_lossy()
-            .to_lowercase()
-            .replace('/', "\\");
+        let user_shims = &*crate::dirs::SHIMS;
+        let sys_shims = crate::env::MISE_SYSTEM_DATA_DIR.join("shims");
         let is_shims = |p: &std::path::PathBuf| {
             let expanded = crate::file::replace_path(p);
-            let normalized = expanded.to_string_lossy().to_lowercase().replace('/', "\\");
-            normalized == shims_normalized || normalized == sys_shims_normalized
+            crate::file::paths_eq(&expanded, user_shims)
+                || crate::file::paths_eq(&expanded, &sys_shims)
         };
         let pristine: std::collections::HashSet<_> = crate::env::PATH
             .iter()
@@ -387,13 +411,36 @@ where
         std::env::join_paths(mise_added.iter().chain(original.iter())).unwrap()
     });
     let program = which::which_in(program, lookup_path, cwd)?;
-    let cmd = cmd::cmd(program, args);
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
 
     // Windows does not support exec in the same way as Unix,
     // so we emulate it instead by not handling Ctrl-C and letting
     // the child process deal with it instead.
     win_exec::set_ctrlc_handler()?;
 
+    // `mise exec -c "<cmd>"` spawns the configured shell as `cmd /c <cmd>`. For
+    // cmd, pass the command verbatim so inner double quotes survive (#9355).
+    // Gated on `shell_body_mode` (the `-c`/`--command` path) so a positional
+    // `mise exec -- cmd /c "echo one" two` is not reinterpreted as a shell body.
+    // cwd is intentionally inherited from the process here, matching the duct
+    // fallback below; the resolved `cwd` above governs program lookup only.
+    if shell_body_mode {
+        if let (Some(prog), [.., last]) = (program.to_str(), args.as_slice()) {
+            let flags: Vec<String> = args[..args.len() - 1]
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            let body = last.to_string_lossy();
+            if let Some(mut c) = crate::path::cmd_verbatim_command(prog, &flags, &body) {
+                match c.status()?.code() {
+                    Some(code) => std::process::exit(code),
+                    None => return Err(eyre!("command failed: terminated by signal")),
+                }
+            }
+        }
+    }
+
+    let cmd = cmd::cmd(program, args);
     let res = cmd.unchecked().run()?;
     match res.status.code() {
         Some(code) => {
@@ -409,6 +456,7 @@ pub async fn exec_program<T, U>(
     args: U,
     env: BTreeMap<String, String>,
     _sandbox: &SandboxConfig,
+    _shell_body_mode: bool,
 ) -> Result<()>
 where
     T: IntoExecutablePath,

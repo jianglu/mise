@@ -37,6 +37,19 @@ Note that shorthand versions (like `21` in the example) use [`OpenJDK`](https://
 For more information on which JDK to choose, see <https://whichjdk.com>.
 :::
 
+## JAVA_HOME
+
+mise automatically sets `JAVA_HOME` to the active Java installation. This requires [`mise activate`](/cli/activate) — shims alone do not set environment variables like `JAVA_HOME`.
+
+If `JAVA_HOME` appears stuck on an old version after changing your `mise.toml`, try:
+
+```sh
+cd . # triggers mise hook-env to re-evaluate
+echo $JAVA_HOME
+```
+
+If using an IDE that reads `JAVA_HOME` at startup, you may need to restart it after switching Java versions. For non-interactive environments (CI, scripts), use `mise exec` or `mise run` which always set up the full environment.
+
 ## macOS JAVA_HOME Integration
 
 Some applications in macOS rely on `/usr/libexec/java_home` to find installed Java runtimes.
@@ -83,7 +96,7 @@ ln -s ~/.sdkman/candidates/java/21.0.1-open ~/.local/share/mise/installs/java/21
 cp ~/.local/share/mise/installs/java/21.0.1-open/lib/libjli.dylib ~/.local/share/mise/installs/java/21.0.1-open/Contents/MacOS/libjli.dylib
 ```
 
-4. Don't forget to make sure the cache is blocked and valid, by making sure an **empty** directory **exists** for your version in the [mise cache](https://mise.jdx.dev/directories.html#cache-mise):
+4. Don't forget to make sure the cache is blocked and valid, by making sure an **empty** directory **exists** for your version in the [mise cache](https://mise.en.dev/directories.html#cache-mise):
    e.g.
 
 ```sh
@@ -97,6 +110,15 @@ mise/java/21.0.1-open:
 
 The following [tool-options](/dev-tools/#tool-options) are available for the `java` backend.
 These options go in the `[tools]` section in `mise.toml`.
+
+### `install_env`
+
+Set environment variables for install-time commands run by the core `java` backend:
+
+```toml
+[tools]
+java = { version = "latest", install_env = { JAVA_TOOL_OPTIONS = "-Djava.net.useSystemProxies=true" } }
+```
 
 ### `release_type`
 
@@ -122,3 +144,10 @@ mkdir -p ~/.asdf/installs/ && ln -s ~/.local/share/mise/installs/java ~/.asdf/in
 ```
 
 Otherwise, you can always use the [foojay-resolver-convention](https://plugins.gradle.org/plugin/org.gradle.toolchains.foojay-resolver-convention) plugin to let Gradle automatically install JDKs required by your project.
+
+## Settings
+
+<script setup>
+import Settings from '/components/settings.vue';
+</script>
+<Settings child="java" :level="3" />

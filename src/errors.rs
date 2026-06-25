@@ -22,7 +22,7 @@ pub enum Error {
     #[error("{} exited with non-zero status: {}", .0, render_exit_status(.1))]
     ScriptFailed(String, Option<ExitStatus>),
     #[error(
-        "Config files in {} are not trusted.\nTrust them with `mise trust`. See https://mise.jdx.dev/cli/trust.html for more information.",
+        "Config files in {} are not trusted.\nTrust them with `mise trust`. See https://mise.en.dev/cli/trust.html for more information.",
         display_path(.0)
     )]
     UntrustedConfig(PathBuf),
@@ -85,6 +85,25 @@ fn format_install_failures(failed_installations: &[(ToolRequest, Report)]) -> St
     }
 
     output.join("\n")
+}
+
+/// Split an install result into successful versions and a result preserving any error.
+pub fn split_install_result(
+    result: Result<Vec<ToolVersion>, Report>,
+) -> (Vec<ToolVersion>, Result<(), Report>) {
+    match result {
+        Ok(versions) => (versions, Ok(())),
+        Err(err) => {
+            let versions = match err.downcast_ref::<Error>() {
+                Some(Error::InstallFailed {
+                    successful_installations,
+                    ..
+                }) => successful_installations.clone(),
+                _ => vec![],
+            };
+            (versions, Err(err))
+        }
+    }
 }
 
 impl Error {

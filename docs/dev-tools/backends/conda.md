@@ -1,4 +1,4 @@
-# Conda Backend <Badge type="warning" text="experimental" />
+# Conda Backend
 
 You may install packages directly from [conda-forge](https://conda-forge.org/) and other
 Anaconda channels without needing conda or mamba installed.
@@ -68,7 +68,7 @@ If a platform-specific package is not available, the backend will fall back to `
 
 ## Settings
 
-Set these with `mise settings set [VARIABLE] [VALUE]` or by setting the environment variable listed.
+Set these with `mise settings set [VARIABLE]=[VALUE]` or by setting the environment variable listed.
 
 <script setup>
 import Settings from '/components/settings.vue';

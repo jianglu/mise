@@ -27,6 +27,11 @@ This relies on having `uv` (recommended) or `pipx` installed.
 
 If you have `uv` installed, mise will use `uv tool install` under the hood and you don't need to install `pipx` to run the commands containing "pipx:".
 
+mise forwards [`minimum_release_age`](/configuration/settings.html#minimum_release_age)
+to transitive Python dependency resolution during install. The uv install path uses uv's
+`--exclude-newer` flag and requires `uv >= 0.2.22`. The `pipx` fallback passes pip's
+`--uploaded-prior-to` flag.
+
 In case you need `pipx` for other reasons, you can install it with or without mise.
 Here is how to install `pipx` with mise:
 
@@ -88,7 +93,7 @@ Other syntax may work but is unsupported and untested.
 
 ## Settings
 
-Set these with `mise settings set [VARIABLE] [VALUE]` or by setting the environment variable listed.
+Set these with `mise settings set [VARIABLE]=[VALUE]` or by setting the environment variable listed.
 
 <script setup>
 import Settings from '/components/settings.vue';
@@ -99,6 +104,17 @@ import Settings from '/components/settings.vue';
 
 The following [tool-options](/dev-tools/#tool-options) are available for the `pipx` backend—these
 go in `[tools]` in `mise.toml`.
+
+### `install_env`
+
+Set environment variables for `uv tool install` or `pipx install`. mise still
+sets the tool directory, bin directory, and configured Python package index
+variables after applying `install_env`.
+
+```toml
+[tools]
+"pipx:black" = { version = "latest", install_env = { PIP_TRUSTED_HOST = "pypi.org" } }
+```
 
 ### `extras`
 

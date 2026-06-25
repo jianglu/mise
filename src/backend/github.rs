@@ -1,15 +1,18 @@
-use crate::backend::SecurityFeature;
 use crate::backend::VersionInfo;
 use crate::backend::asset_matcher::{self, Asset, AssetPicker, ChecksumFetcher};
 use crate::backend::backend_type::BackendType;
+use crate::backend::options::BackendOptions;
 use crate::backend::platform_target::PlatformTarget;
 use crate::backend::static_helpers::{
-    get_filename_from_url, install_artifact, lookup_platform_key, lookup_platform_key_for_target,
+    get_filename_from_url, install_artifact, lookup_platform_key, lookup_with_fallback,
     template_string, try_with_v_prefix, try_with_v_prefix_and_repo, verify_artifact,
+};
+use crate::backend::{
+    MISE_BINS_DIR, SecurityFeature, backend_arg_matches_registry_backend,
+    runtime_path_for_install_path,
 };
 use crate::cli::args::{BackendArg, ToolVersionType};
 use crate::config::{Config, Settings};
-use crate::env;
 use crate::file;
 use crate::http::HTTP;
 use crate::install_context::InstallContext;
@@ -41,10 +44,146 @@ const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
 const DEFAULT_GITLAB_API_BASE_URL: &str = "https://gitlab.com/api/v4";
 const DEFAULT_FORGEJO_API_BASE_URL: &str = "https://codeberg.org/api/v1";
 
+#[derive(Debug, Clone, Copy)]
+struct GitBackendOptions<'a> {
+    values: BackendOptions<'a>,
+    default_api_url: &'static str,
+}
+
+impl<'a> GitBackendOptions<'a> {
+    fn new(raw: &'a ToolVersionOptions, default_api_url: &'static str) -> Self {
+        Self {
+            values: BackendOptions::new(raw),
+            default_api_url,
+        }
+    }
+
+    fn raw(&self) -> &'a ToolVersionOptions {
+        self.values.raw()
+    }
+
+    fn api_url(&self) -> String {
+        self.values
+            .str("api_url")
+            .unwrap_or(self.default_api_url)
+            .to_string()
+    }
+
+    fn version_prefix(&self) -> Option<&'a str> {
+        self.values.str("version_prefix")
+    }
+
+    fn checksum(&self) -> Option<String> {
+        self.values.platform_string("checksum")
+    }
+
+    fn bin_path(&self) -> Option<String> {
+        self.values.platform_string("bin_path")
+    }
+
+    fn asset_pattern_for_target(&self, target: &PlatformTarget) -> Option<String> {
+        self.values
+            .platform_string_for_target("asset_pattern", target)
+    }
+
+    fn direct_url_for_target(&self, target: &PlatformTarget) -> Option<String> {
+        self.values
+            .platform_string_for_target_without_base("url", target)
+    }
+
+    fn no_app_for_target(&self, target: &PlatformTarget) -> bool {
+        self.values.platform_bool_for_target("no_app", target)
+    }
+
+    fn filter_bins(&self) -> Option<Vec<String>> {
+        self.values
+            .platform_string("filter_bins")
+            .map(|filter_bins| {
+                filter_bins
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+    }
+
+    /// Substring an asset name must contain to remain a candidate, applied as a
+    /// pre-filter before platform autodetection (ported from the ubi backend).
+    fn matching(&self) -> Option<&'a str> {
+        self.values.str("matching")
+    }
+
+    /// Regex an asset name must match to remain a candidate, applied as a
+    /// pre-filter before platform autodetection (ported from the ubi backend).
+    fn matching_regex(&self) -> Option<&'a str> {
+        self.values.str("matching_regex")
+    }
+
+    /// `matching`/`matching_regex` for *provenance* selection, suppressed when
+    /// `asset_pattern` is set for this target.
+    ///
+    /// `asset_pattern` replaces autodetection and selects the binary directly,
+    /// ignoring the matching pre-filter (see the asset-selection call sites). Its
+    /// provenance must therefore align with that asset by platform alone:
+    /// re-applying `matching` here could narrow provenance to a *different* binary
+    /// than `asset_pattern` picked. Suppressing it also keeps an invalid
+    /// `matching_regex` — which is never validated on the asset_pattern path,
+    /// since that path skips `match_by_auto_detection` — from reaching the
+    /// provenance picker and silently returning no provenance (a verification
+    /// downgrade). When `asset_pattern` is unset this is just `matching`/
+    /// `matching_regex` unchanged.
+    fn matching_for_provenance(
+        &self,
+        target: &PlatformTarget,
+    ) -> (Option<&'a str>, Option<&'a str>) {
+        if self.asset_pattern_for_target(target).is_some() {
+            (None, None)
+        } else {
+            (self.matching(), self.matching_regex())
+        }
+    }
+
+    fn lockfile_options(&self, target: &PlatformTarget) -> BTreeMap<String, String> {
+        let mut result = BTreeMap::new();
+        if self.api_url() != self.default_api_url {
+            result.insert("api_url".to_string(), self.api_url());
+        }
+        if let Some(value) = self.version_prefix() {
+            result.insert("version_prefix".to_string(), value.to_string());
+        }
+        if let Some(value) = self.asset_pattern_for_target(target) {
+            result.insert("asset_pattern".to_string(), value);
+        }
+        if let Some(value) = self.direct_url_for_target(target) {
+            result.insert("url".to_string(), value);
+        }
+        if self.no_app_for_target(target) {
+            result.insert("no_app".to_string(), "true".to_string());
+        }
+        if let Some(value) = self.matching() {
+            result.insert("matching".to_string(), value.to_string());
+        }
+        if let Some(value) = self.matching_regex() {
+            result.insert("matching_regex".to_string(), value.to_string());
+        }
+        result
+    }
+}
+
+/// GitHub artifact attestations are only served by https://api.github.com. GHE
+/// Server doesn't implement the attestations endpoint, so any verification
+/// attempt against a custom api_url will fail. Callers gate on this so users
+/// don't have to disable `MISE_GITHUB_ATTESTATIONS` globally for GHE tools.
+fn attestations_supported(api_url: &str) -> bool {
+    api_url.trim_end_matches('/') == DEFAULT_GITHUB_API_BASE_URL
+}
+
 /// Status returned from verification attempts
 enum VerificationStatus {
     /// No attestations or provenance found (not an error, tool may not have them)
     NoAttestations,
+    /// A remote API or download failed while checking provenance.
+    ApiError(String),
     /// An error occurred during verification
     Error(String),
 }
@@ -52,13 +191,24 @@ enum VerificationStatus {
 /// Check if an SLSA verification error indicates a format/parsing issue rather than
 /// an actual verification failure. Some provenance files (e.g., BuildKit raw provenance)
 /// exist but aren't in a sigstore-verifiable format.
-fn is_slsa_format_issue(e: &sigstore_verification::AttestationError) -> bool {
+///
+/// `Sigstore(msg)` covers errors that originated in `sigstore-verify` itself
+/// (e.g. `missing field 'verificationMaterial'` when the file is a legacy
+/// cosign v1 bundle that the modern bundle deserializer rejects). Those are
+/// format mismatches, not signature failures, so we let the caller fall
+/// back to alternate verification paths.
+fn is_slsa_format_issue(e: &crate::github::sigstore::AttestationError) -> bool {
     match e {
-        sigstore_verification::AttestationError::NoAttestations => true,
-        sigstore_verification::AttestationError::Verification(msg) => {
+        crate::github::sigstore::AttestationError::NoAttestations => true,
+        crate::github::sigstore::AttestationError::UnsupportedFormat(_) => true,
+        crate::github::sigstore::AttestationError::Verification(msg)
+        | crate::github::sigstore::AttestationError::Sigstore(msg) => {
             msg.contains("does not contain valid attestations")
                 || msg.contains("No certificate found")
                 || msg.contains("neither DSSE envelope nor message signature")
+                || msg.contains("missing field")
+                || msg.contains("not a sigstore or cosign bundle")
+                || msg.contains("not a JSON DSSE envelope")
         }
         _ => false,
     }
@@ -71,6 +221,8 @@ pub fn install_time_option_keys() -> Vec<String> {
         "url".into(),
         "version_prefix".into(),
         "no_app".into(),
+        "matching".into(),
+        "matching_regex".into(),
     ]
 }
 
@@ -100,8 +252,9 @@ impl Backend for UnifiedGitBackend {
 
         // Get the latest release to check for security assets
         let repo = self.ba.tool_name();
-        let opts = self.ba.opts();
-        let api_url = self.get_api_url(&opts);
+        let raw_opts = self.ba.opts();
+        let opts = self.options(&raw_opts);
+        let api_url = opts.api_url();
 
         let releases = github::list_releases_from_url(api_url.as_str(), &repo)
             .await
@@ -154,15 +307,17 @@ impl Backend for UnifiedGitBackend {
         features
     }
 
+    fn remote_version_listing_tool_option_keys(&self) -> &'static [&'static str] {
+        &["api_url", "version_prefix"]
+    }
+
     async fn _list_remote_versions(&self, config: &Arc<Config>) -> Result<Vec<VersionInfo>> {
         let repo = self.ba.tool_name();
         let id = self.ba.to_string();
-        let opts = config
-            .get_tool_opts(&self.ba)
-            .await?
-            .unwrap_or_else(|| self.ba.opts());
-        let api_url = self.get_api_url(&opts);
-        let version_prefix = opts.get("version_prefix");
+        let raw_opts = config.get_tool_opts_with_overrides(&self.ba).await?;
+        let opts = self.options(&raw_opts);
+        let api_url = opts.api_url();
+        let version_prefix = opts.version_prefix();
 
         // Derive web URL base from API URL for enterprise support
         let web_url_base = if self.is_gitlab() {
@@ -189,7 +344,7 @@ impl Backend for UnifiedGitBackend {
             format!("{}/{}", web_url, repo)
         };
 
-        // Get releases with full metadata from GitHub or GitLab
+        // Get releases with full metadata from GitHub, GitLab, or Forgejo
         let raw_versions: Vec<VersionInfo> = if self.is_gitlab() {
             gitlab::list_releases_from_url(api_url.as_str(), &repo)
                 .await?
@@ -203,7 +358,7 @@ impl Backend for UnifiedGitBackend {
                 })
                 .collect()
         } else if self.is_forgejo() {
-            forgejo::list_releases_from_url(api_url.as_str(), &repo)
+            forgejo::list_releases_including_prereleases_from_url(api_url.as_str(), &repo)
                 .await?
                 .into_iter()
                 .filter(|r| version_prefix.is_none_or(|p| r.tag_name.starts_with(p)))
@@ -211,11 +366,17 @@ impl Backend for UnifiedGitBackend {
                     version: self.strip_version_prefix(&r.tag_name, &opts),
                     created_at: Some(r.created_at),
                     release_url: Some(format!("{}/releases/tag/{}", web_url_base, r.tag_name)),
+                    prerelease: r.prerelease,
                     ..Default::default()
                 })
                 .collect()
         } else {
-            github::list_releases_from_url(api_url.as_str(), &repo)
+            // Always fetch the pre-release superset and stamp `prerelease` on
+            // each entry. The shared remote-versions cache stores the superset
+            // so flipping the `prerelease` tool option (e.g. via a project
+            // override) is correct without invalidating the cache; the read
+            // path filters on `prerelease` according to the current opts.
+            github::list_releases_including_prereleases_from_url(api_url.as_str(), &repo)
                 .await?
                 .into_iter()
                 .filter(|r| version_prefix.is_none_or(|p| r.tag_name.starts_with(p)))
@@ -223,6 +384,7 @@ impl Backend for UnifiedGitBackend {
                     version: self.strip_version_prefix(&r.tag_name, &opts),
                     created_at: Some(r.created_at),
                     release_url: Some(format!("{}/releases/tag/{}", web_url_base, r.tag_name)),
+                    prerelease: r.prerelease,
                     ..Default::default()
                 })
                 .collect()
@@ -244,34 +406,47 @@ impl Backend for UnifiedGitBackend {
         Ok(versions)
     }
 
-    async fn latest_stable_version(&self, config: &Arc<Config>) -> eyre::Result<Option<String>> {
+    async fn latest_stable_version_info(
+        &self,
+        config: &Arc<Config>,
+    ) -> eyre::Result<Option<VersionInfo>> {
         if Settings::get().offline() {
             trace!("Skipping latest stable version due to offline mode");
             return Ok(None);
         }
 
         let repo = self.ba.tool_name();
-        let opts = config
-            .get_tool_opts(&self.ba)
-            .await?
-            .unwrap_or_else(|| self.ba.opts());
-        let api_url = self.get_api_url(&opts);
-        let version_prefix = opts.get("version_prefix");
+        let raw_opts = config.get_tool_opts_with_overrides(&self.ba).await?;
+        let opts = self.options(&raw_opts);
+        let api_url = opts.api_url();
+        let version_prefix = opts.version_prefix();
 
-        let latest_tag = if self.is_gitlab() {
+        // When `prerelease = true`, skip the `/releases/latest` shortcut
+        // (which returns whichever release the repo owner marked as "Latest",
+        // defaulting to the newest non-prerelease). Returning `None` lets the
+        // trait's `latest_version` fall through to `latest_version_for_query`,
+        // which resolves against the full list — now including pre-releases.
+        if self.include_prereleases(opts.raw()) {
+            return Ok(None);
+        }
+
+        let latest_release = if self.is_gitlab() {
             // GitLab doesn't have a "latest" endpoint
-            return self.latest_version(config, Some("latest".into())).await;
+            return Ok(None);
         } else if self.is_forgejo() {
             match forgejo::get_release_for_url(&api_url, &repo, "latest").await {
-                Ok(r) => Some(r.tag_name),
+                Ok(r) => Some((r.tag_name, r.created_at, r.prerelease)),
                 Err(e) => {
                     debug!("Failed to fetch latest Forgejo release for {repo}: {e}");
                     None
                 }
             }
         } else {
-            match github::get_release_for_url(&api_url, &repo, "latest").await {
-                Ok(r) => Some(r.tag_name),
+            match self
+                .get_github_release_for_url(&api_url, &repo, "latest")
+                .await
+            {
+                Ok(r) => Some((r.tag_name, r.created_at, r.prerelease)),
                 Err(e) => {
                     debug!("Failed to fetch latest GitHub release for {repo}: {e}");
                     None
@@ -279,13 +454,52 @@ impl Backend for UnifiedGitBackend {
             }
         };
 
-        let latest_version = latest_tag
-            .filter(|tag| version_prefix.is_none_or(|p| tag.starts_with(p)))
-            .map(|tag| self.strip_version_prefix(&tag, &opts));
+        Ok(latest_release
+            .filter(|(tag, _, _)| version_prefix.is_none_or(|p| tag.starts_with(p)))
+            .map(|(tag, created_at, prerelease)| VersionInfo {
+                version: self.strip_version_prefix(&tag, &opts),
+                created_at: Some(created_at),
+                prerelease,
+                ..Default::default()
+            }))
+    }
 
-        match latest_version {
-            Some(version) => Ok(Some(version)),
-            None => self.latest_version(config, Some("latest".into())).await,
+    async fn resolve_exact_version(
+        &self,
+        config: &Arc<Config>,
+        version: &str,
+    ) -> eyre::Result<Option<String>> {
+        if Settings::get().offline() || self.is_gitlab() || self.is_forgejo() {
+            return Ok(None);
+        }
+
+        let repo = self.repo();
+        let raw_opts = config.get_tool_opts_with_overrides(&self.ba).await?;
+        let opts = self.options(&raw_opts);
+        let api_url = opts.api_url();
+        let version_prefix = opts.version_prefix();
+
+        let use_versions_host = self.use_versions_host_for_github_metadata();
+        match try_with_v_prefix_and_repo(version, version_prefix, Some(&repo), |candidate| {
+            let api_url = api_url.clone();
+            let repo = repo.clone();
+            async move {
+                github::get_release_for_url_with_versions_host(
+                    &api_url,
+                    &repo,
+                    &candidate,
+                    use_versions_host,
+                )
+                .await
+            }
+        })
+        .await
+        {
+            Ok(release) => Ok(Some(self.strip_version_prefix(&release.tag_name, &opts))),
+            Err(e) => {
+                debug!("Failed to resolve exact GitHub release for {repo}@{version}: {e}");
+                Ok(None)
+            }
         }
     }
 
@@ -295,12 +509,31 @@ impl Backend for UnifiedGitBackend {
         mut tv: ToolVersion,
     ) -> Result<ToolVersion> {
         let repo = self.repo();
-        let opts = ctx
-            .config
-            .get_tool_opts(&self.ba)
-            .await?
-            .unwrap_or_else(|| self.ba.opts());
-        let api_url = self.get_api_url(&opts);
+        let raw_opts = ctx.config.get_tool_opts_with_overrides(&self.ba).await?;
+        let opts = self.options(&raw_opts);
+        let api_url = opts.api_url();
+
+        // Validate `matching_regex` up front, before the cached-URL branch below.
+        // Reusing a cached lockfile URL skips binary selection (the path that
+        // normally hard-errors on a bad pattern), so without this an invalid
+        // regex would reach the provenance picker, return `None`, and silently
+        // skip SLSA verification rather than failing closed.
+        //
+        // Skip this when `asset_pattern` is set: it supersedes `matching`/
+        // `matching_regex` for both binary selection and provenance (see
+        // `matching_for_provenance` and `resolve_*_asset_url_for_target`), so the
+        // regex is never consulted and an invalid one is irrelevant. mise doesn't
+        // hard-fail on options it won't act on — `url` short-circuits before
+        // `asset_pattern` is ever templated (resolve_asset_url_for_target), an
+        // ignored hook `shell` is dropped with a warning (src/hooks.rs), and
+        // unknown tool-option keys are silently ignored. Validating here would be
+        // the lone exception that rejects a superseded option.
+        if opts
+            .asset_pattern_for_target(&PlatformTarget::from_current())
+            .is_none()
+        {
+            asset_matcher::validate_matching_regex(opts.matching_regex())?;
+        }
 
         // Check if URL already exists in lockfile platforms first
         let platform_key = self.get_platform_key();
@@ -336,29 +569,27 @@ impl Backend for UnifiedGitBackend {
         _config: &Arc<Config>,
         tv: &ToolVersion,
     ) -> Result<Vec<std::path::PathBuf>> {
-        if self.get_filter_bins(tv).is_some() {
-            return Ok(vec![tv.install_path().join(".mise-bins")]);
+        let raw_opts = tv.request.options();
+        let opts = self.options(&raw_opts);
+        let mise_bins_dir = tv.install_path().join(MISE_BINS_DIR);
+        if opts.filter_bins().is_some() || mise_bins_dir.is_dir() {
+            return Ok(vec![tv.runtime_path().join(MISE_BINS_DIR)]);
         }
 
-        self.discover_bin_paths(tv)
+        Ok(self
+            .discover_bin_paths(tv)?
+            .into_iter()
+            .map(|path| runtime_path_for_install_path(tv, path))
+            .collect())
     }
 
     fn resolve_lockfile_options(
         &self,
         request: &ToolRequest,
-        _target: &PlatformTarget,
-    ) -> BTreeMap<String, String> {
-        let opts = request.options();
-        let mut result = BTreeMap::new();
-
-        // These options affect which artifact is downloaded
-        for key in ["asset_pattern", "url", "version_prefix"] {
-            if let Some(value) = opts.get(key) {
-                result.insert(key.to_string(), value.to_string());
-            }
-        }
-
-        result
+        target: &PlatformTarget,
+    ) -> Result<BTreeMap<String, String>> {
+        let raw_opts = request.options();
+        Ok(self.options(&raw_opts).lockfile_options(target))
     }
 
     /// Resolve platform-specific lock information for cross-platform lockfile generation.
@@ -369,8 +600,22 @@ impl Backend for UnifiedGitBackend {
         target: &PlatformTarget,
     ) -> Result<PlatformInfo> {
         let repo = self.repo();
-        let opts = tv.request.options();
-        let api_url = self.get_api_url(&opts);
+        let raw_opts = tv.request.options();
+        let opts = self.options(&raw_opts);
+        let api_url = opts.api_url();
+
+        // Fail closed on an invalid `matching_regex` instead of writing an empty
+        // entry. The `Err` arm below intentionally swallows resolution failures so a
+        // platform with no matching asset is skipped rather than failing the whole
+        // (best-effort) lock — but `resolve_asset_url_for_target` returns the same
+        // `Err` for an invalid regex, which would then be caught and written as a
+        // url-less `PlatformInfo::default()`. Returning `Err` here makes the lock
+        // orchestration skip the platform (no entry written) instead. Gated on the
+        // same `asset_pattern` precedence as everywhere else, so an ignored regex is
+        // never validated.
+        if opts.asset_pattern_for_target(target).is_none() {
+            asset_matcher::validate_matching_regex(opts.matching_regex())?;
+        }
 
         // Resolve asset for the target platform
         let asset = self
@@ -380,7 +625,7 @@ impl Backend for UnifiedGitBackend {
         match asset {
             Ok(asset) => {
                 // Detect provenance availability from release assets and attestation API
-                let provenance = if !self.is_gitlab() && !self.is_forgejo() {
+                let mut provenance = if !self.is_gitlab() && !self.is_forgejo() {
                     self.detect_provenance_type(
                         tv,
                         &opts,
@@ -389,16 +634,39 @@ impl Backend for UnifiedGitBackend {
                         asset.digest.as_deref(),
                         target,
                     )
-                    .await
+                    .await?
                 } else {
                     None
                 };
 
+                // For the current platform, verify provenance cryptographically at lock time.
+                // This ensures the lockfile's provenance entry is backed by actual verification,
+                // not just an API query. Cross-platform entries remain detection-only.
+                if provenance.is_some() && target.is_current() {
+                    match self
+                        .verify_provenance_at_lock_time(tv, &opts, &repo, &api_url, &asset)
+                        .await
+                    {
+                        Ok(verified) => {
+                            provenance = verified;
+                        }
+                        Err(e) => {
+                            // Clear provenance so install-time verification will run.
+                            warn!(
+                                "lock-time provenance verification failed for {}, \
+                                 will be verified at install time: {e}",
+                                self.ba.full()
+                            );
+                            provenance = None;
+                        }
+                    }
+                }
                 Ok(PlatformInfo {
                     url: Some(asset.url),
                     url_api: Some(asset.url_api),
                     checksum: asset.digest,
                     provenance,
+                    github_attestations: None,
                     ..Default::default()
                 })
             }
@@ -420,65 +688,121 @@ impl UnifiedGitBackend {
         Self { ba: Arc::new(ba) }
     }
 
+    fn options<'a>(&self, raw: &'a ToolVersionOptions) -> GitBackendOptions<'a> {
+        GitBackendOptions::new(raw, self.default_api_url())
+    }
+
+    fn default_api_url(&self) -> &'static str {
+        if self.is_gitlab() {
+            DEFAULT_GITLAB_API_BASE_URL
+        } else if self.is_forgejo() {
+            DEFAULT_FORGEJO_API_BASE_URL
+        } else {
+            DEFAULT_GITHUB_API_BASE_URL
+        }
+    }
+
+    fn use_versions_host_for_github_metadata(&self) -> bool {
+        backend_arg_matches_registry_backend(&self.ba)
+    }
+
+    async fn get_github_release_for_url(
+        &self,
+        api_url: &str,
+        repo: &str,
+        tag: &str,
+    ) -> Result<github::GithubRelease> {
+        github::get_release_for_url_with_versions_host(
+            api_url,
+            repo,
+            tag,
+            self.use_versions_host_for_github_metadata(),
+        )
+        .await
+    }
+
     /// Detect what provenance type is available for a release by checking its assets
     /// and querying the GitHub attestation API.
     async fn detect_provenance_type(
         &self,
         tv: &ToolVersion,
-        opts: &ToolVersionOptions,
+        opts: &GitBackendOptions<'_>,
         repo: &str,
         api_url: &str,
         asset_digest: Option<&str>,
         target: &PlatformTarget,
-    ) -> Option<ProvenanceType> {
+    ) -> Result<Option<ProvenanceType>> {
         let settings = Settings::get();
         let version = &tv.version;
-        let version_prefix = opts.get("version_prefix");
+        let version_prefix = opts.version_prefix();
 
+        let use_versions_host = self.use_versions_host_for_github_metadata();
         let release =
             try_with_v_prefix_and_repo(version, version_prefix, Some(repo), |candidate| {
                 let api_url = api_url.to_string();
                 let repo = repo.to_string();
-                async move { github::get_release_for_url(&api_url, &repo, &candidate).await }
+                async move {
+                    github::get_release_for_url_with_versions_host(
+                        &api_url,
+                        &repo,
+                        &candidate,
+                        use_versions_host,
+                    )
+                    .await
+                }
             })
             .await
-            .ok()?;
+            .ok();
+        let Some(release) = release else {
+            return Ok(None);
+        };
 
         // Check github-attestations first (higher priority, matching install verification order)
         // Uses the asset digest from the GitHub API to query attestations without downloading
         if settings.github_attestations
             && settings.github.github_attestations
+            && attestations_supported(api_url)
             && let Some(digest) = asset_digest
         {
             let parts: Vec<&str> = repo.split('/').collect();
             if parts.len() == 2 {
                 let (owner, repo_name) = (parts[0], parts[1]);
-                match sigstore_verification::sources::github::GitHubSource::new(
+                match crate::github::sigstore::detect_attestations(
                     owner,
                     repo_name,
-                    env::GITHUB_TOKEN.as_deref(),
-                ) {
-                    Ok(source) => {
-                        use sigstore_verification::AttestationSource;
-                        let artifact_ref = sigstore_verification::ArtifactRef::from_digest(digest);
-                        match source.fetch_attestations(&artifact_ref).await {
-                            Ok(attestations) if !attestations.is_empty() => {
-                                return Some(ProvenanceType::GithubAttestations);
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                warn!(
-                                    "GitHub attestation API query failed for {owner}/{repo_name}: {e}. \
-                                     Lockfile may not record github-attestations provenance."
-                                );
-                            }
+                    api_url,
+                    digest,
+                    self.use_versions_host_for_github_metadata(),
+                )
+                .await
+                {
+                    Ok(true) => return Ok(Some(ProvenanceType::GithubAttestations)),
+                    Ok(false) => {}
+                    Err(crate::github::sigstore::DetectError::SourceCreation(e)) => {
+                        if !settings.provenance_api_failures_fatal
+                            && crate::github::sigstore::is_api_failure(&e)
+                        {
+                            warn!(
+                                "failed to create GitHub attestation source for {owner}/{repo_name}, skipping attestation provenance: {e}"
+                            );
+                        } else {
+                            return Err(eyre::eyre!(
+                                "failed to create GitHub attestation source for {owner}/{repo_name}: {e}"
+                            ));
                         }
                     }
-                    Err(e) => {
-                        warn!(
-                            "Failed to create GitHub attestation source for {owner}/{repo_name}: {e}. \
-                             Lockfile may not record github-attestations provenance."
-                        );
+                    Err(crate::github::sigstore::DetectError::Fetch(e)) => {
+                        if !settings.provenance_api_failures_fatal
+                            && crate::github::sigstore::is_api_failure(&e)
+                        {
+                            warn!(
+                                "GitHub attestation API query failed for {owner}/{repo_name}, skipping attestation provenance: {e}"
+                            );
+                        } else {
+                            return Err(eyre::eyre!(
+                                "GitHub attestation API query failed for {owner}/{repo_name}: {e}"
+                            ));
+                        }
                     }
                 }
             }
@@ -489,17 +813,221 @@ impl UnifiedGitBackend {
         // when a matching provenance file exists for the target platform.
         if settings.slsa && settings.github.slsa {
             let asset_names: Vec<String> = release.assets.iter().map(|a| a.name.clone()).collect();
+            // Narrow provenance the same way the binary is narrowed, so a
+            // multi-binary release's per-binary provenance files don't
+            // cross-verify the wrong digest. Suppressed when `asset_pattern` is
+            // set (it selects the binary, ignoring `matching`).
+            let (matching, matching_regex) = opts.matching_for_provenance(target);
             let picker = AssetPicker::with_libc(
                 target.os_name().to_string(),
                 target.arch_name().to_string(),
                 target.qualifier().map(|s| s.to_string()),
-            );
-            if picker.pick_best_provenance(&asset_names).is_some() {
-                return Some(ProvenanceType::Slsa { url: None });
+            )
+            .with_matching(matching.unwrap_or_default())
+            .with_matching_regex(matching_regex.unwrap_or_default());
+            if let Some(provenance_name) = picker.pick_best_provenance(&asset_names) {
+                let url = release
+                    .assets
+                    .iter()
+                    .find(|a| a.name == provenance_name)
+                    .map(|a| a.browser_download_url.clone());
+                return Ok(Some(ProvenanceType::Slsa { url }));
             }
         }
 
-        None
+        Ok(None)
+    }
+
+    /// Verify provenance at lock time by downloading the artifact to a temp directory
+    /// and running cryptographic verification. Only called for the current platform
+    /// during `mise lock`.
+    async fn verify_provenance_at_lock_time(
+        &self,
+        tv: &ToolVersion,
+        opts: &GitBackendOptions<'_>,
+        repo: &str,
+        api_url: &str,
+        asset: &ReleaseAsset,
+    ) -> Result<Option<ProvenanceType>> {
+        let tmp_dir = tempfile::tempdir()?;
+        let filename = get_filename_from_url(&asset.url);
+        let artifact_path = tmp_dir.path().join(&filename);
+
+        info!(
+            "downloading artifact for lock-time provenance verification: {}",
+            filename
+        );
+
+        // Use the API URL with appropriate headers for downloading
+        let download_url = if self.is_gitlab() {
+            asset.url.clone()
+        } else {
+            asset.url_api.clone()
+        };
+        let headers = if self.is_gitlab() {
+            gitlab::get_headers(&download_url)
+        } else if self.is_forgejo() {
+            forgejo::get_headers(&download_url)
+        } else {
+            github::get_headers(&download_url)?
+        };
+        HTTP.download_file_with_headers(&download_url, &artifact_path, &headers, None)
+            .await?;
+
+        let settings = Settings::get();
+
+        // Try GitHub artifact attestations first (highest priority)
+        if settings.github_attestations
+            && settings.github.github_attestations
+            && attestations_supported(api_url)
+        {
+            let parts: Vec<&str> = repo.split('/').collect();
+            if parts.len() == 2 {
+                let (owner, repo_name) = (parts[0], parts[1]);
+                match crate::github::sigstore::verify_attestation(
+                    &artifact_path,
+                    owner,
+                    repo_name,
+                    None,
+                    Some(api_url),
+                    self.use_versions_host_for_github_metadata(),
+                )
+                .await
+                {
+                    Ok(true) => {
+                        debug!("lock-time GitHub attestations verified for {}", repo);
+                        return Ok(Some(ProvenanceType::GithubAttestations));
+                    }
+                    Ok(false) => {
+                        return Err(eyre::eyre!(
+                            "GitHub artifact attestations verification returned false"
+                        ));
+                    }
+                    Err(crate::github::sigstore::AttestationError::NoAttestations) => {
+                        debug!("no GitHub attestations found at lock time, trying SLSA");
+                    }
+                    Err(e) => {
+                        return Err(eyre::eyre!(
+                            "GitHub artifact attestations verification failed: {e}"
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Fall back to SLSA provenance
+        if settings.slsa && settings.github.slsa {
+            let version = &tv.version;
+            let version_prefix = opts.version_prefix();
+            let use_versions_host = self.use_versions_host_for_github_metadata();
+            let release =
+                try_with_v_prefix_and_repo(version, version_prefix, Some(repo), |candidate| {
+                    let api_url = api_url.to_string();
+                    let repo = repo.to_string();
+                    async move {
+                        github::get_release_for_url_with_versions_host(
+                            &api_url,
+                            &repo,
+                            &candidate,
+                            use_versions_host,
+                        )
+                        .await
+                    }
+                })
+                .await?;
+
+            let asset_names: Vec<String> = release.assets.iter().map(|a| a.name.clone()).collect();
+            let current_platform = PlatformTarget::from_current();
+            // Keep provenance aligned with the matching-selected binary, unless
+            // `asset_pattern` is set (it selects the binary, ignoring `matching`).
+            let (matching, matching_regex) = opts.matching_for_provenance(&current_platform);
+            let picker = AssetPicker::with_libc(
+                current_platform.os_name().to_string(),
+                current_platform.arch_name().to_string(),
+                current_platform.qualifier().map(|s| s.to_string()),
+            )
+            .with_matching(matching.unwrap_or_default())
+            .with_matching_regex(matching_regex.unwrap_or_default());
+
+            if let Some(provenance_name) = picker.pick_best_provenance(&asset_names) {
+                let provenance_asset = release
+                    .assets
+                    .iter()
+                    .find(|a| a.name == provenance_name)
+                    .expect("provenance asset should exist since we found its name");
+
+                let provenance_path = tmp_dir.path().join(&provenance_asset.name);
+                HTTP.download_file(
+                    &provenance_asset.browser_download_url,
+                    &provenance_path,
+                    None,
+                )
+                .await?;
+
+                let provenance_url = provenance_asset.browser_download_url.clone();
+                match crate::github::sigstore::verify_slsa_provenance(
+                    &artifact_path,
+                    &provenance_path,
+                    1u8,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        debug!("lock-time SLSA provenance verified for {}", repo);
+                        return Ok(Some(ProvenanceType::Slsa {
+                            url: Some(provenance_url),
+                        }));
+                    }
+                    Ok(false) => {
+                        return Err(eyre::eyre!("SLSA provenance verification failed"));
+                    }
+                    Err(e) => {
+                        if crate::github::sigstore::is_slsa_subject_mismatch(&e) {
+                            debug!(
+                                "lock-time SLSA provenance did not cover downloaded artifact for {}; trying archive content subjects: {e}",
+                                repo
+                            );
+                            match self
+                                .try_verify_slsa_archive_contents(
+                                    tv,
+                                    &artifact_path,
+                                    &provenance_path,
+                                )
+                                .await
+                            {
+                                Ok(true) => {
+                                    debug!(
+                                        "lock-time SLSA provenance verified archive contents for {}",
+                                        repo
+                                    );
+                                    return Ok(Some(ProvenanceType::Slsa {
+                                        url: Some(provenance_url),
+                                    }));
+                                }
+                                Ok(false) => {
+                                    return Err(eyre::eyre!(
+                                        "SLSA archive content verification failed"
+                                    ));
+                                }
+                                Err(content_err) => {
+                                    return Err(eyre::eyre!(
+                                        "SLSA archive content verification error: {content_err}"
+                                    ));
+                                }
+                            }
+                        } else if is_slsa_format_issue(&e) {
+                            debug!("SLSA provenance file not in verifiable format: {e}");
+                        } else {
+                            return Err(eyre::eyre!("SLSA verification error: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+
+        Err(eyre::eyre!(
+            "provenance was detected but could not be verified at lock time"
+        ))
     }
 
     fn is_gitlab(&self) -> bool {
@@ -517,6 +1045,14 @@ impl UnifiedGitBackend {
         self.ba.tool_name()
     }
 
+    fn preferred_asset_name(&self) -> String {
+        self.repo()
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
     // Helper to format asset names for error messages
     fn format_asset_list<'a, I>(assets: I) -> String
     where
@@ -525,33 +1061,19 @@ impl UnifiedGitBackend {
         assets.cloned().collect::<Vec<_>>().join(", ")
     }
 
-    fn get_api_url(&self, opts: &ToolVersionOptions) -> String {
-        opts.get("api_url")
-            .unwrap_or(if self.is_gitlab() {
-                DEFAULT_GITLAB_API_BASE_URL
-            } else if self.is_forgejo() {
-                DEFAULT_FORGEJO_API_BASE_URL
-            } else {
-                DEFAULT_GITHUB_API_BASE_URL
-            })
-            .to_string()
-    }
-
     /// Downloads and installs the asset
     async fn download_and_install(
         &self,
         ctx: &InstallContext,
         tv: &mut ToolVersion,
         asset: &ReleaseAsset,
-        opts: &ToolVersionOptions,
+        opts: &GitBackendOptions<'_>,
     ) -> Result<()> {
         let filename = asset.name.clone();
         let file_path = tv.download_path().join(&filename);
 
         // Check if we'll verify checksum
-        let has_checksum = lookup_platform_key(opts, "checksum")
-            .or_else(|| opts.get("checksum").map(|s| s.to_string()))
-            .is_some();
+        let has_checksum = opts.checksum().is_some();
 
         // Store the asset URL and digest (if available) in the tool version
         let platform_key = self.get_platform_key();
@@ -605,7 +1127,7 @@ impl UnifiedGitBackend {
         } else if self.is_forgejo() {
             forgejo::get_headers(&url)
         } else {
-            github::get_headers(&url)
+            github::get_headers(&url)?
         };
 
         ctx.pr.set_message(format!("download {filename}"));
@@ -615,7 +1137,7 @@ impl UnifiedGitBackend {
         // Verify and install
         ctx.pr.next_operation();
         if has_checksum {
-            verify_artifact(tv, &file_path, opts, Some(ctx.pr.as_ref()))?;
+            verify_artifact(tv, &file_path, opts.raw(), Some(ctx.pr.as_ref()))?;
         }
 
         // Check before verify_checksum, which may generate a new checksum from the
@@ -625,11 +1147,13 @@ impl UnifiedGitBackend {
         let has_lockfile_integrity = tv
             .lock_platforms
             .get(&platform_key)
-            .is_some_and(|pi| pi.checksum.is_some() && pi.provenance.is_some());
+            .is_some_and(PlatformInfo::has_checksum_and_verified_provenance);
 
         self.verify_checksum(ctx, tv, &file_path)?;
 
-        if has_lockfile_integrity {
+        let settings = Settings::get();
+        let force_verify = settings.force_provenance_verify();
+        if has_lockfile_integrity && !force_verify {
             // Still check that the recorded provenance type's setting is enabled —
             // disabling a verification setting with a provenance-bearing lockfile is a downgrade.
             self.ensure_provenance_setting_enabled(tv, &platform_key)?;
@@ -639,16 +1163,17 @@ impl UnifiedGitBackend {
                 .await?;
 
             // Record provenance verification result in lock_platforms
-            if let Some(provenance_type) = provenance_result {
+            if provenance_result.is_some() {
                 let platform_info = tv.lock_platforms.entry(platform_key).or_default();
-                platform_info.provenance = Some(provenance_type);
+                platform_info.provenance = provenance_result;
+                platform_info.github_attestations = None;
             }
         }
 
         ctx.pr.next_operation();
-        install_artifact(tv, &file_path, opts, Some(ctx.pr.as_ref()))?;
+        install_artifact(tv, &file_path, opts.raw(), Some(ctx.pr.as_ref()))?;
 
-        if let Some(bins) = self.get_filter_bins(tv) {
+        if let Some(bins) = opts.filter_bins() {
             self.create_symlink_bin_dir(tv, bins)?;
         }
 
@@ -657,10 +1182,9 @@ impl UnifiedGitBackend {
 
     /// Discovers bin paths in the installation directory
     fn discover_bin_paths(&self, tv: &ToolVersion) -> Result<Vec<std::path::PathBuf>> {
-        let opts = tv.request.options();
-        if let Some(bin_path_template) = lookup_platform_key(&opts, "bin_path")
-            .or_else(|| opts.get("bin_path").map(|s| s.to_string()))
-        {
+        let raw_opts = tv.request.options();
+        let opts = self.options(&raw_opts);
+        if let Some(bin_path_template) = opts.bin_path() {
             let bin_path = template_string(&bin_path_template, tv);
             return Ok(vec![tv.install_path().join(&bin_path)]);
         }
@@ -735,7 +1259,7 @@ impl UnifiedGitBackend {
     async fn resolve_asset_url(
         &self,
         tv: &ToolVersion,
-        opts: &ToolVersionOptions,
+        opts: &GitBackendOptions<'_>,
         repo: &str,
         api_url: &str,
     ) -> Result<ReleaseAsset> {
@@ -748,13 +1272,13 @@ impl UnifiedGitBackend {
     async fn resolve_asset_url_for_target(
         &self,
         tv: &ToolVersion,
-        opts: &ToolVersionOptions,
+        opts: &GitBackendOptions<'_>,
         repo: &str,
         api_url: &str,
         target: &PlatformTarget,
     ) -> Result<ReleaseAsset> {
         // Check for direct platform-specific URLs first
-        if let Some(direct_url) = lookup_platform_key_for_target(opts, "url", target) {
+        if let Some(direct_url) = opts.direct_url_for_target(target) {
             return Ok(ReleaseAsset {
                 name: get_filename_from_url(&direct_url),
                 url: direct_url.clone(),
@@ -764,7 +1288,7 @@ impl UnifiedGitBackend {
         }
 
         let version = &tv.version;
-        let version_prefix = opts.get("version_prefix");
+        let version_prefix = opts.version_prefix();
         if self.is_gitlab() {
             try_with_v_prefix(version, version_prefix, |candidate| async move {
                 self.resolve_gitlab_asset_url_for_target(
@@ -802,13 +1326,15 @@ impl UnifiedGitBackend {
     async fn resolve_github_asset_url_for_target(
         &self,
         tv: &ToolVersion,
-        opts: &ToolVersionOptions,
+        opts: &GitBackendOptions<'_>,
         repo: &str,
         api_url: &str,
         version: &str,
         target: &PlatformTarget,
     ) -> Result<ReleaseAsset> {
-        let release = github::get_release_for_url(api_url, repo, version).await?;
+        let release = self
+            .get_github_release_for_url(api_url, repo, version)
+            .await?;
         let available_assets: Vec<String> = release.assets.iter().map(|a| a.name.clone()).collect();
 
         // Build asset list with URLs for checksum fetching
@@ -818,17 +1344,16 @@ impl UnifiedGitBackend {
             .map(|a| Asset::new(&a.name, &a.browser_download_url))
             .collect();
 
-        // Try explicit pattern first
-        if let Some(pattern) = lookup_platform_key_for_target(opts, "asset_pattern", target)
-            .or_else(|| opts.get("asset_pattern").map(|s| s.to_string()))
-        {
+        // Try explicit pattern first. `asset_pattern` replaces autodetection
+        // entirely, so it intentionally takes precedence over and ignores
+        // `matching`/`matching_regex` (there is no autodetected candidate set left
+        // to narrow). Do NOT thread the matching filter into this branch.
+        if let Some(pattern) = opts.asset_pattern_for_target(target) {
             // Template the pattern for the target platform
             let templated_pattern = template_string_for_target(&pattern, tv, target);
 
-            let asset = release
-                .assets
-                .into_iter()
-                .find(|a| self.matches_pattern(&a.name, &templated_pattern))
+            let asset = self
+                .pick_by_pattern(release.assets, &templated_pattern, |a| &a.name)
                 .ok_or_else(|| {
                     eyre::eyre!(
                         "No matching asset found for pattern: {}\nAvailable assets: {}",
@@ -854,13 +1379,12 @@ impl UnifiedGitBackend {
         }
 
         // Fall back to auto-detection for target platform
-        let no_app = opts
-            .get("no_app")
-            .and_then(|v| v.parse::<bool>().ok())
-            .unwrap_or(false);
         let asset_name = asset_matcher::AssetMatcher::new()
             .for_target(target)
-            .with_no_app(no_app)
+            .with_no_app(opts.no_app_for_target(target))
+            .with_preferred_name(self.preferred_asset_name())
+            .with_matching(opts.matching().unwrap_or_default())
+            .with_matching_regex(opts.matching_regex().unwrap_or_default())
             .pick_from(&available_assets)?
             .name;
         let asset = self
@@ -893,7 +1417,7 @@ impl UnifiedGitBackend {
     async fn resolve_gitlab_asset_url_for_target(
         &self,
         tv: &ToolVersion,
-        opts: &ToolVersionOptions,
+        opts: &GitBackendOptions<'_>,
         repo: &str,
         api_url: &str,
         version: &str,
@@ -915,18 +1439,16 @@ impl UnifiedGitBackend {
             .map(|a| Asset::new(&a.name, &a.direct_asset_url))
             .collect();
 
-        // Try explicit pattern first
-        if let Some(pattern) = lookup_platform_key_for_target(opts, "asset_pattern", target)
-            .or_else(|| opts.get("asset_pattern").map(|s| s.to_string()))
-        {
+        // Try explicit pattern first. `asset_pattern` replaces autodetection
+        // entirely, so it intentionally takes precedence over and ignores
+        // `matching`/`matching_regex` (there is no autodetected candidate set left
+        // to narrow). Do NOT thread the matching filter into this branch.
+        if let Some(pattern) = opts.asset_pattern_for_target(target) {
             // Template the pattern for the target platform
             let templated_pattern = template_string_for_target(&pattern, tv, target);
 
-            let asset = release
-                .assets
-                .links
-                .into_iter()
-                .find(|a| self.matches_pattern(&a.name, &templated_pattern))
+            let asset = self
+                .pick_by_pattern(release.assets.links, &templated_pattern, |a| &a.name)
                 .ok_or_else(|| {
                     eyre::eyre!(
                         "No matching asset found for pattern: {}\nAvailable assets: {}",
@@ -949,13 +1471,12 @@ impl UnifiedGitBackend {
         }
 
         // Fall back to auto-detection for target platform
-        let no_app = opts
-            .get("no_app")
-            .and_then(|v| v.parse::<bool>().ok())
-            .unwrap_or(false);
         let asset_name = asset_matcher::AssetMatcher::new()
             .for_target(target)
-            .with_no_app(no_app)
+            .with_no_app(opts.no_app_for_target(target))
+            .with_preferred_name(self.preferred_asset_name())
+            .with_matching(opts.matching().unwrap_or_default())
+            .with_matching_regex(opts.matching_regex().unwrap_or_default())
             .pick_from(&available_assets)?
             .name;
         let asset = self
@@ -985,7 +1506,7 @@ impl UnifiedGitBackend {
     async fn resolve_forgejo_asset_url_for_target(
         &self,
         tv: &ToolVersion,
-        opts: &ToolVersionOptions,
+        opts: &GitBackendOptions<'_>,
         repo: &str,
         api_url: &str,
         version: &str,
@@ -1010,17 +1531,16 @@ impl UnifiedGitBackend {
             )
         };
 
-        // Try explicit pattern first
-        if let Some(pattern) = lookup_platform_key_for_target(opts, "asset_pattern", target)
-            .or_else(|| opts.get("asset_pattern").map(|s| s.to_string()))
-        {
+        // Try explicit pattern first. `asset_pattern` replaces autodetection
+        // entirely, so it intentionally takes precedence over and ignores
+        // `matching`/`matching_regex` (there is no autodetected candidate set left
+        // to narrow). Do NOT thread the matching filter into this branch.
+        if let Some(pattern) = opts.asset_pattern_for_target(target) {
             // Template the pattern for the target platform
             let templated_pattern = template_string_for_target(&pattern, tv, target);
 
-            let asset = release
-                .assets
-                .into_iter()
-                .find(|a| self.matches_pattern(&a.name, &templated_pattern))
+            let asset = self
+                .pick_by_pattern(release.assets, &templated_pattern, |a| &a.name)
                 .ok_or_else(|| {
                     eyre::eyre!(
                         "No matching asset found for pattern: {}\nAvailable assets: {}",
@@ -1043,13 +1563,12 @@ impl UnifiedGitBackend {
         }
 
         // Fall back to auto-detection for target platform
-        let no_app = opts
-            .get("no_app")
-            .and_then(|v| v.parse::<bool>().ok())
-            .unwrap_or(false);
         let asset_name = asset_matcher::AssetMatcher::new()
             .for_target(target)
-            .with_no_app(no_app)
+            .with_no_app(opts.no_app_for_target(target))
+            .with_preferred_name(self.preferred_asset_name())
+            .with_matching(opts.matching().unwrap_or_default())
+            .with_matching_regex(opts.matching_regex().unwrap_or_default())
             .pick_from(&available_assets)?
             .name;
         let asset = self
@@ -1093,24 +1612,44 @@ impl UnifiedGitBackend {
             })
     }
 
-    fn matches_pattern(&self, asset_name: &str, pattern: &str) -> bool {
-        // Simple pattern matching - convert glob-like pattern to regex
+    /// Picks the best asset from `assets` whose name matches `pattern`.
+    ///
+    /// When a pattern matches more than one asset (e.g. `*linux*64` matching both
+    /// `cloudflared-linux-amd64` and `cloudflared-fips-linux-amd64`), prefer the
+    /// shortest name, then lexicographic order for determinism. Mirrors the
+    /// tiebreaker used by auto-detection.
+    /// See: https://github.com/jdx/mise/discussions/9358
+    fn pick_by_pattern<T, I, F>(&self, assets: I, pattern: &str, name_of: F) -> Option<T>
+    where
+        I: IntoIterator<Item = T>,
+        F: Fn(&T) -> &str,
+    {
+        // Compile the regex once instead of recompiling per asset.
         let regex_pattern = pattern
             .replace(".", "\\.")
             .replace("*", ".*")
             .replace("?", ".");
+        let re = Regex::new(&format!("^{regex_pattern}$")).ok();
 
-        if let Ok(re) = Regex::new(&format!("^{regex_pattern}$")) {
-            re.is_match(asset_name)
-        } else {
-            // Fallback to simple contains check
-            asset_name.contains(pattern)
-        }
+        assets
+            .into_iter()
+            .filter(|a| {
+                let name = name_of(a);
+                match &re {
+                    Some(re) => re.is_match(name),
+                    None => name.contains(pattern),
+                }
+            })
+            .min_by(|a, b| {
+                let na = name_of(a);
+                let nb = name_of(b);
+                na.len().cmp(&nb.len()).then_with(|| na.cmp(nb))
+            })
     }
 
-    fn strip_version_prefix(&self, tag_name: &str, opts: &ToolVersionOptions) -> String {
+    fn strip_version_prefix(&self, tag_name: &str, opts: &GitBackendOptions<'_>) -> String {
         // If a custom version_prefix is configured, strip it first
-        if let Some(prefix) = opts.get("version_prefix")
+        if let Some(prefix) = opts.version_prefix()
             && let Some(stripped) = tag_name.strip_prefix(prefix)
         {
             return stripped.to_string();
@@ -1169,23 +1708,9 @@ impl UnifiedGitBackend {
         }
     }
 
-    fn get_filter_bins(&self, tv: &ToolVersion) -> Option<Vec<String>> {
-        let opts = tv.request.options();
-        let filter_bins = lookup_platform_key(&opts, "filter_bins")
-            .or_else(|| opts.get("filter_bins").map(|s| s.to_string()))?;
-
-        Some(
-            filter_bins
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
-        )
-    }
-
     /// Creates a `.mise-bins` directory with symlinks only to the binaries specified in filter_bins.
     fn create_symlink_bin_dir(&self, tv: &ToolVersion, bins: Vec<String>) -> Result<()> {
-        let symlink_dir = tv.install_path().join(".mise-bins");
+        let symlink_dir = tv.install_path().join(MISE_BINS_DIR);
         file::create_dir_all(&symlink_dir)?;
 
         // Find where the actual binaries are
@@ -1238,8 +1763,8 @@ impl UnifiedGitBackend {
                     Ok(!settings.github_attestations || !settings.github.github_attestations)
                 }
                 ProvenanceType::Slsa { .. } => Ok(!settings.slsa || !settings.github.slsa),
-                // The github backend only writes GithubAttestations and Slsa; reaching here
-                // means a lockfile was hand-edited or migrated incorrectly.
+                // The github backend only writes GithubAttestations and Slsa; reaching here means
+                // a lockfile was hand-edited or migrated incorrectly.
                 _ => Err(eyre::eyre!(
                     "Lockfile has unexpected provenance type {provenance} for github backend tool {tv}. \
                      Update the lockfile to remove the stale provenance entry."
@@ -1252,8 +1777,7 @@ impl UnifiedGitBackend {
     /// Tries attestations first, falls back to SLSA if no attestations found.
     /// If verification is attempted and fails, it's a hard error.
     ///
-    /// Returns `Ok(Some((type, url)))` if provenance was verified successfully,
-    /// or `Ok(None)` if no provenance was found (not an error).
+    /// Returns the verified provenance type and the GitHub attestation probe status.
     async fn verify_attestations_or_slsa(
         &self,
         ctx: &InstallContext,
@@ -1271,10 +1795,10 @@ impl UnifiedGitBackend {
             .lock_platforms
             .get(&platform_key)
             .and_then(|pi| pi.provenance.clone());
-
+        let expected_provenance = locked_provenance.as_ref();
         // Only verify for GitHub repos (not GitLab/Forgejo)
         if self.is_gitlab() || self.is_forgejo() {
-            if let Some(ref expected) = locked_provenance {
+            if let Some(expected) = expected_provenance {
                 return Err(eyre::eyre!(
                     "Lockfile requires {expected} provenance for {tv} but verification is not available \
                      for GitLab/Forgejo backends. This may indicate a downgrade attack."
@@ -1284,21 +1808,40 @@ impl UnifiedGitBackend {
         }
 
         // When the lockfile specifies a provenance type, only run that specific mechanism
-        let skip_attestations = locked_provenance
-            .as_ref()
-            .is_some_and(|l| !l.is_github_attestations());
-        let skip_slsa = locked_provenance.as_ref().is_some_and(|l| !l.is_slsa());
+        let skip_attestations = expected_provenance.is_some_and(|l| !l.is_github_attestations());
+        let skip_slsa = expected_provenance.is_some_and(|l| !l.is_slsa());
+
+        // If the lockfile expects github-attestations but the configured api_url
+        // doesn't support them (e.g. GHE Server), surface a clear, actionable
+        // error rather than falling through to the generic "downgrade attack"
+        // path below.
+        let raw_opts = tv.request.options();
+        let opts = self.options(&raw_opts);
+        let api_url = opts.api_url();
+        if !attestations_supported(&api_url)
+            && let Some(expected) = expected_provenance
+            && expected.is_github_attestations()
+        {
+            return Err(eyre::eyre!(
+                "Lockfile requires github-attestations provenance for {tv} but the \
+                 configured api_url ({api_url}) does not serve attestations. \
+                 Re-run `mise lock` to refresh the lockfile, or remove the custom api_url."
+            ));
+        }
 
         // Try GitHub artifact attestations first (if enabled globally and for github backend)
-        if !skip_attestations && settings.github_attestations && settings.github.github_attestations
+        if !skip_attestations
+            && settings.github_attestations
+            && settings.github.github_attestations
+            && attestations_supported(&api_url)
         {
             match self
-                .try_verify_github_attestations(ctx, tv, file_path)
+                .try_verify_github_attestations(ctx, tv, file_path, &api_url)
                 .await
             {
                 Ok(true) => {
                     // Defense-in-depth: verify the result matches the lockfile expectation
-                    if let Some(ref expected) = locked_provenance
+                    if let Some(expected) = expected_provenance
                         && !expected.is_github_attestations()
                     {
                         return Err(eyre::eyre!(
@@ -1318,6 +1861,14 @@ impl UnifiedGitBackend {
                     // No attestations - fall through to try SLSA
                     debug!("No GitHub artifact attestations found for {tv}, trying SLSA");
                 }
+                Err(VerificationStatus::ApiError(e)) => {
+                    if expected_provenance.is_some() || settings.provenance_api_failures_fatal {
+                        return Err(eyre::eyre!(
+                            "GitHub artifact attestations verification error for {tv}: {e}"
+                        ));
+                    }
+                    warn!("GitHub artifact attestations API failed for {tv}, trying SLSA: {e}");
+                }
                 Err(VerificationStatus::Error(e)) => {
                     // Error during verification - hard error
                     return Err(eyre::eyre!(
@@ -1329,10 +1880,10 @@ impl UnifiedGitBackend {
 
         // Fall back to SLSA provenance (if enabled globally and for github backend)
         if !skip_slsa && settings.slsa && settings.github.slsa {
-            match self.try_verify_slsa(ctx, tv, file_path).await {
+            match self.try_verify_slsa(ctx, tv, file_path, &api_url).await {
                 Ok((true, provenance_url)) => {
                     // Defense-in-depth: verify the result matches the lockfile expectation
-                    if let Some(ref expected) = locked_provenance
+                    if let Some(expected) = expected_provenance
                         && !expected.is_slsa()
                     {
                         return Err(eyre::eyre!(
@@ -1352,6 +1903,12 @@ impl UnifiedGitBackend {
                     // No provenance found - this is fine
                     debug!("No SLSA provenance found for {tv}");
                 }
+                Err(VerificationStatus::ApiError(e)) => {
+                    if expected_provenance.is_some() || settings.provenance_api_failures_fatal {
+                        return Err(eyre::eyre!("SLSA verification error for {tv}: {e}"));
+                    }
+                    warn!("SLSA provenance API failed for {tv}, skipping SLSA provenance: {e}");
+                }
                 Err(VerificationStatus::Error(e)) => {
                     // Error during verification - hard error
                     return Err(eyre::eyre!("SLSA verification error for {tv}: {e}"));
@@ -1360,7 +1917,7 @@ impl UnifiedGitBackend {
         }
 
         // If lockfile recorded provenance but no verification succeeded, it's a downgrade attack
-        if let Some(ref expected) = locked_provenance {
+        if let Some(expected) = expected_provenance {
             return Err(eyre::eyre!(
                 "Lockfile requires {expected} provenance for {tv} but verification was not performed. \
                  This may indicate a downgrade attack. Enable the corresponding verification setting \
@@ -1381,6 +1938,7 @@ impl UnifiedGitBackend {
         ctx: &InstallContext,
         tv: &ToolVersion,
         file_path: &std::path::Path,
+        api_url: &str,
     ) -> std::result::Result<bool, VerificationStatus> {
         ctx.pr
             .set_message("verify GitHub artifact attestations".to_string());
@@ -1395,12 +1953,13 @@ impl UnifiedGitBackend {
         }
         let (owner, repo_name) = (parts[0], parts[1]);
 
-        match sigstore_verification::verify_github_attestation(
+        match crate::github::sigstore::verify_attestation(
             file_path,
             owner,
             repo_name,
-            env::GITHUB_TOKEN.as_deref(),
             None, // We don't know the expected workflow
+            Some(api_url),
+            self.use_versions_host_for_github_metadata(),
         )
         .await
         {
@@ -1412,11 +1971,60 @@ impl UnifiedGitBackend {
                 }
                 Ok(verified)
             }
-            Err(sigstore_verification::AttestationError::NoAttestations) => {
+            Err(crate::github::sigstore::AttestationError::NoAttestations) => {
                 Err(VerificationStatus::NoAttestations)
+            }
+            Err(e) if crate::github::sigstore::is_api_failure(&e) => {
+                Err(VerificationStatus::ApiError(e.to_string()))
             }
             Err(e) => Err(VerificationStatus::Error(e.to_string())),
         }
+    }
+
+    async fn try_verify_slsa_archive_contents(
+        &self,
+        tv: &ToolVersion,
+        file_path: &std::path::Path,
+        provenance_path: &std::path::Path,
+    ) -> Result<bool> {
+        let raw_opts = tv.request.options();
+        let format = if let Some(format_opt) = lookup_with_fallback(&raw_opts, "format") {
+            file::ExtractionFormat::from_ext(&format_opt).unwrap_or(file::ExtractionFormat::Raw)
+        } else {
+            file::ExtractionFormat::from_file_name(
+                &file_path.file_name().unwrap_or_default().to_string_lossy(),
+            )
+        };
+
+        if !format.is_archive() {
+            return Err(eyre::eyre!(
+                "SLSA provenance subject mismatch and content-level fallback is only supported for archives"
+            ));
+        }
+
+        let mut strip_components = lookup_platform_key(&raw_opts, "strip_components")
+            .or_else(|| raw_opts.get_string("strip_components"))
+            .and_then(|s| s.parse().ok());
+        if strip_components.is_none()
+            && lookup_with_fallback(&raw_opts, "bin_path").is_none()
+            && file::should_strip_components(file_path, format)?
+        {
+            strip_components = Some(1);
+        }
+
+        let contents =
+            file::archive_content_files(file_path, format, strip_components.unwrap_or(0))?;
+        let artifacts = contents
+            .into_iter()
+            .map(|content| crate::github::sigstore::SlsaArtifact {
+                name: content.name,
+                sha256: content.sha256,
+            })
+            .collect::<Vec<_>>();
+
+        crate::github::sigstore::verify_slsa_provenance_artifacts(provenance_path, &artifacts, 1u8)
+            .await
+            .map_err(|e| eyre::eyre!("content-level SLSA verification failed: {e}"))
     }
 
     /// Try to verify SLSA provenance. Returns:
@@ -1429,6 +2037,7 @@ impl UnifiedGitBackend {
         ctx: &InstallContext,
         tv: &ToolVersion,
         file_path: &std::path::Path,
+        api_url: &str,
     ) -> std::result::Result<(bool, Option<String>), VerificationStatus> {
         if self.is_gitlab() || self.is_forgejo() {
             return Err(VerificationStatus::NoAttestations);
@@ -1438,23 +2047,32 @@ impl UnifiedGitBackend {
 
         // Get the release to find provenance assets
         let repo = self.repo();
-        let opts = tv.request.options();
-        let api_url = self.get_api_url(&opts);
+        let raw_opts = tv.request.options();
+        let opts = self.options(&raw_opts);
         let version = &tv.version;
 
         // Try to get the release (with version prefix support)
-        let version_prefix = opts.get("version_prefix");
+        let version_prefix = opts.version_prefix();
+        let use_versions_host = self.use_versions_host_for_github_metadata();
         let release =
             match try_with_v_prefix_and_repo(version, version_prefix, Some(&repo), |candidate| {
-                let api_url = api_url.clone();
+                let api_url = api_url.to_string();
                 let repo = repo.clone();
-                async move { github::get_release_for_url(&api_url, &repo, &candidate).await }
+                async move {
+                    github::get_release_for_url_with_versions_host(
+                        &api_url,
+                        &repo,
+                        &candidate,
+                        use_versions_host,
+                    )
+                    .await
+                }
             })
             .await
             {
                 Ok(r) => r,
                 Err(e) => {
-                    return Err(VerificationStatus::Error(format!(
+                    return Err(VerificationStatus::ApiError(format!(
                         "Failed to get release: {e}"
                     )));
                 }
@@ -1463,11 +2081,17 @@ impl UnifiedGitBackend {
         // Find the best provenance asset for the current platform
         let asset_names: Vec<String> = release.assets.iter().map(|a| a.name.clone()).collect();
         let current_platform = PlatformTarget::from_current();
+        // Keep provenance aligned with the matching-selected binary at install
+        // time, matching the selection used at lock time. Suppressed when
+        // `asset_pattern` is set (it selects the binary, ignoring `matching`).
+        let (matching, matching_regex) = opts.matching_for_provenance(&current_platform);
         let picker = AssetPicker::with_libc(
             current_platform.os_name().to_string(),
             current_platform.arch_name().to_string(),
             current_platform.qualifier().map(|s| s.to_string()),
-        );
+        )
+        .with_matching(matching.unwrap_or_default())
+        .with_matching_regex(matching_regex.unwrap_or_default());
 
         let provenance_name = match picker.pick_best_provenance(&asset_names) {
             Some(name) => name,
@@ -1494,7 +2118,7 @@ impl UnifiedGitBackend {
             )
             .await
         {
-            return Err(VerificationStatus::Error(format!(
+            return Err(VerificationStatus::ApiError(format!(
                 "Failed to download provenance: {e}"
             )));
         }
@@ -1503,7 +2127,7 @@ impl UnifiedGitBackend {
 
         // Verify the provenance
         let provenance_download_url = provenance_asset.browser_download_url.clone();
-        match sigstore_verification::verify_slsa_provenance(
+        match crate::github::sigstore::verify_slsa_provenance(
             file_path,
             &provenance_path,
             1, // Minimum SLSA level
@@ -1519,7 +2143,24 @@ impl UnifiedGitBackend {
                 }
             }
             Err(e) => {
-                if is_slsa_format_issue(&e) {
+                if crate::github::sigstore::is_slsa_subject_mismatch(&e) {
+                    debug!(
+                        "SLSA provenance did not cover downloaded artifact for {tv}; trying archive content subjects: {e}"
+                    );
+                    match self
+                        .try_verify_slsa_archive_contents(tv, file_path, &provenance_path)
+                        .await
+                    {
+                        Ok(true) => {
+                            debug!(
+                                "SLSA provenance verified archive contents successfully for {tv}"
+                            );
+                            Ok((true, Some(provenance_download_url)))
+                        }
+                        Ok(false) => Ok((false, None)),
+                        Err(content_err) => Err(VerificationStatus::Error(content_err.to_string())),
+                    }
+                } else if is_slsa_format_issue(&e) {
                     debug!("SLSA provenance file not in verifiable format for {tv}: {e}");
                     Err(VerificationStatus::NoAttestations)
                 } else {
@@ -1584,6 +2225,10 @@ fn template_string_for_target(template: &str, tv: &ToolVersion, target: &Platfor
             .replace("{gnu_arch}", gnu_arch);
     }
 
+    if !crate::tera::contains_template_syntax(template) {
+        return template.to_string();
+    }
+
     // Use Tera rendering for templates
     let mut ctx = crate::tera::BASE_CONTEXT.clone();
     ctx.insert("version", version);
@@ -1609,7 +2254,7 @@ fn template_string_for_target(template: &str, tv: &ToolVersion, target: &Platfor
     tera.register_function("os", make_remapping_fn(os.to_string()));
     tera.register_function("arch", make_remapping_fn(arch.to_string()));
 
-    match tera.render_str(template, &ctx) {
+    match crate::tera::render_str(&mut tera, template, &ctx) {
         Ok(rendered) => rendered,
         Err(e) => {
             warn!("Failed to render template '{}': {}", template, e);
@@ -1625,22 +2270,87 @@ mod tests {
 
     fn create_test_backend() -> UnifiedGitBackend {
         UnifiedGitBackend::from_arg(BackendArg::new(
-            "github".to_string(),
+            "github:test/repo".to_string(),
             Some("github:test/repo".to_string()),
         ))
     }
 
+    fn create_test_gitlab_backend() -> UnifiedGitBackend {
+        UnifiedGitBackend::from_arg(BackendArg::new(
+            "gitlab:test/repo".to_string(),
+            Some("gitlab:test/repo".to_string()),
+        ))
+    }
+
+    fn create_test_forgejo_backend() -> UnifiedGitBackend {
+        UnifiedGitBackend::from_arg(BackendArg::new(
+            "forgejo:test/repo".to_string(),
+            Some("forgejo:test/repo".to_string()),
+        ))
+    }
+
     #[test]
-    fn test_pattern_matching() {
+    fn test_pick_by_pattern_basic() {
+        // Single-match cases that the old `matches_pattern` test covered.
         let backend = create_test_backend();
-        assert!(backend.matches_pattern("test-v1.0.0.zip", "test-*"));
-        assert!(!backend.matches_pattern("other-v1.0.0.zip", "test-*"));
+        let matches = |asset: &str, pat: &str| {
+            backend
+                .pick_by_pattern(vec![asset.to_string()], pat, |s| s.as_str())
+                .is_some()
+        };
+        assert!(matches("test-v1.0.0.zip", "test-*"));
+        assert!(!matches("other-v1.0.0.zip", "test-*"));
+    }
+
+    #[test]
+    fn test_pick_by_pattern_shortest_match_wins() {
+        // When asset_pattern matches more than one asset, prefer the shortest
+        // (then lexicographic for determinism). Mirrors the auto-detection
+        // tiebreaker so users don't get the GitHub-API-order asset on a
+        // broad pattern like `*linux*64`.
+        // See: https://github.com/jdx/mise/discussions/9358
+        let backend = create_test_backend();
+        let assets = vec![
+            "cloudflared-fips-linux-amd64".to_string(),
+            "cloudflared-linux-amd64".to_string(),
+        ];
+        let picked = backend.pick_by_pattern(assets.clone(), "*linux*64", |s| s.as_str());
+        assert_eq!(picked.as_deref(), Some("cloudflared-linux-amd64"));
+
+        // Order-independent.
+        let assets_reordered = vec![
+            "cloudflared-linux-amd64".to_string(),
+            "cloudflared-fips-linux-amd64".to_string(),
+        ];
+        let picked = backend.pick_by_pattern(assets_reordered, "*linux*64", |s| s.as_str());
+        assert_eq!(picked.as_deref(), Some("cloudflared-linux-amd64"));
+    }
+
+    #[test]
+    fn test_pick_by_pattern_no_match() {
+        let backend = create_test_backend();
+        let assets = vec!["a.zip".to_string(), "b.zip".to_string()];
+        let picked = backend.pick_by_pattern(assets, "c.zip", |s| s.as_str());
+        assert!(picked.is_none());
+    }
+
+    #[test]
+    fn test_pick_by_pattern_exact_match() {
+        // Anchored pattern with no wildcards only matches one asset.
+        let backend = create_test_backend();
+        let assets = vec![
+            "cloudflared-fips-linux-amd64".to_string(),
+            "cloudflared-linux-amd64".to_string(),
+        ];
+        let picked = backend.pick_by_pattern(assets, "cloudflared-linux-amd64", |s| s.as_str());
+        assert_eq!(picked.as_deref(), Some("cloudflared-linux-amd64"));
     }
 
     #[test]
     fn test_version_prefix_functionality() {
         let backend = create_test_backend();
-        let default_opts = ToolVersionOptions::default();
+        let default_raw_opts = ToolVersionOptions::default();
+        let default_opts = backend.options(&default_raw_opts);
 
         // Test with no version prefix configured
         assert_eq!(
@@ -1685,12 +2395,231 @@ mod tests {
             "version_prefix".to_string(),
             toml::Value::String("release-".to_string()),
         );
+        let opts = backend.options(&opts);
 
         assert_eq!(
             backend.strip_version_prefix("release-1.0.0", &opts),
             "1.0.0"
         );
         assert_eq!(backend.strip_version_prefix("1.0.0", &opts), "1.0.0");
+    }
+
+    #[test]
+    fn test_matching_options_are_install_time_keys() {
+        // `matching`/`matching_regex` must be install-time-only keys so a stale
+        // cached filter from a prior install can't silently override what's in
+        // mise.toml now. They are deliberately NOT folded into the install path
+        // (that stays keyed by tool name + version) — `tool_alias` is the way to
+        // install multiple binaries from one repo into distinct dirs.
+        let keys = install_time_option_keys();
+        assert!(keys.contains(&"matching".to_string()));
+        assert!(keys.contains(&"matching_regex".to_string()));
+    }
+
+    #[test]
+    fn test_lockfile_options_use_target_artifact_inputs() {
+        let backend = create_test_backend();
+        let mut opts = ToolVersionOptions::default();
+        opts.opts.insert(
+            "api_url".to_string(),
+            toml::Value::String("https://github.example.com/api/v3".to_string()),
+        );
+        opts.opts.insert(
+            "version_prefix".to_string(),
+            toml::Value::String("release-".to_string()),
+        );
+        // matching/matching_regex are top-level (not per-platform) options; they
+        // must round-trip into lockfile_options for every target so a relock on
+        // another OS reproduces the same asset selection.
+        opts.opts.insert(
+            "matching".to_string(),
+            toml::Value::String("tool".to_string()),
+        );
+        opts.opts.insert(
+            "matching_regex".to_string(),
+            toml::Value::String("^tool-".to_string()),
+        );
+        let mut platforms = toml::Table::new();
+        let mut linux = toml::Table::new();
+        linux.insert(
+            "asset_pattern".to_string(),
+            toml::Value::String("tool-*-linux.tar.gz".to_string()),
+        );
+        let mut windows = toml::Table::new();
+        windows.insert(
+            "asset_pattern".to_string(),
+            toml::Value::String("tool-*-windows.zip".to_string()),
+        );
+        windows.insert("no_app".to_string(), toml::Value::Boolean(true));
+        platforms.insert("linux-x64".to_string(), toml::Value::Table(linux));
+        platforms.insert("windows-x64".to_string(), toml::Value::Table(windows));
+        opts.opts
+            .insert("platforms".to_string(), toml::Value::Table(platforms));
+
+        let linux = PlatformTarget::new(crate::platform::Platform::parse("linux-x64").unwrap());
+        let windows = PlatformTarget::new(crate::platform::Platform::parse("windows-x64").unwrap());
+
+        assert_eq!(
+            backend.options(&opts).lockfile_options(&linux),
+            BTreeMap::from([
+                (
+                    "api_url".to_string(),
+                    "https://github.example.com/api/v3".to_string()
+                ),
+                (
+                    "asset_pattern".to_string(),
+                    "tool-*-linux.tar.gz".to_string()
+                ),
+                ("matching".to_string(), "tool".to_string()),
+                ("matching_regex".to_string(), "^tool-".to_string()),
+                ("version_prefix".to_string(), "release-".to_string()),
+            ])
+        );
+        assert_eq!(
+            backend.options(&opts).lockfile_options(&windows),
+            BTreeMap::from([
+                (
+                    "api_url".to_string(),
+                    "https://github.example.com/api/v3".to_string()
+                ),
+                (
+                    "asset_pattern".to_string(),
+                    "tool-*-windows.zip".to_string()
+                ),
+                ("matching".to_string(), "tool".to_string()),
+                ("matching_regex".to_string(), "^tool-".to_string()),
+                ("no_app".to_string(), "true".to_string()),
+                ("version_prefix".to_string(), "release-".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_matching_for_provenance_suppressed_when_asset_pattern_set() {
+        // `asset_pattern` selects the binary directly and ignores `matching`, so
+        // provenance must NOT be narrowed by `matching` on that path — otherwise a
+        // self-contradictory config could attach a *different* binary's provenance
+        // than `asset_pattern` picked, and an invalid `matching_regex` (never
+        // validated on the asset_pattern path) could silently skip verification.
+        let backend = create_test_backend();
+        let mut opts = ToolVersionOptions::default();
+        opts.opts.insert(
+            "matching".to_string(),
+            toml::Value::String("oxlint".to_string()),
+        );
+        opts.opts.insert(
+            "matching_regex".to_string(),
+            toml::Value::String("^oxlint-".to_string()),
+        );
+        // asset_pattern set for linux only, not for macos.
+        let mut platforms = toml::Table::new();
+        let mut linux = toml::Table::new();
+        linux.insert(
+            "asset_pattern".to_string(),
+            toml::Value::String("oxlint-*-linux.tar.gz".to_string()),
+        );
+        platforms.insert("linux-x64".to_string(), toml::Value::Table(linux));
+        opts.opts
+            .insert("platforms".to_string(), toml::Value::Table(platforms));
+
+        let linux = PlatformTarget::new(crate::platform::Platform::parse("linux-x64").unwrap());
+        let macos = PlatformTarget::new(crate::platform::Platform::parse("macos-arm64").unwrap());
+
+        // asset_pattern set for this target -> matching suppressed for provenance.
+        assert_eq!(
+            backend.options(&opts).matching_for_provenance(&linux),
+            (None, None)
+        );
+        // No asset_pattern for this target -> matching flows through to provenance.
+        assert_eq!(
+            backend.options(&opts).matching_for_provenance(&macos),
+            (Some("oxlint"), Some("^oxlint-"))
+        );
+    }
+
+    #[test]
+    fn test_matching_plumbing_parity_across_git_backends() {
+        // The github/gitlab/forgejo backends share one option struct
+        // (`GitBackendOptions`) and one `AssetMatcher`, but each has its OWN
+        // `resolve_*_asset_url_for_target` function that threads
+        // `matching`/`matching_regex` separately (copy-paste identical today, with
+        // only backend-specific asset/digest plumbing differing). This test guards
+        // the shared seams those three paths depend on from drifting per backend
+        // type: the option accessors, lockfile serialization, and install-time-key
+        // inheritance must behave identically for all three. The resolve functions
+        // themselves are covered end-to-end for github by
+        // e2e/backend/test_github_matching, and the matcher all three feed is
+        // covered by the asset_matcher unit tests.
+        let mut opts = ToolVersionOptions::default();
+        opts.opts.insert(
+            "matching".to_string(),
+            toml::Value::String("oxlint".to_string()),
+        );
+        opts.opts.insert(
+            "matching_regex".to_string(),
+            toml::Value::String("^oxlint-".to_string()),
+        );
+        let target = PlatformTarget::new(crate::platform::Platform::parse("linux-x64").unwrap());
+
+        // Guard that the helpers really build distinct backend types, so the loop
+        // below genuinely exercises gitlab/forgejo and isn't three githubs.
+        assert!(create_test_gitlab_backend().is_gitlab());
+        assert!(create_test_forgejo_backend().is_forgejo());
+
+        for backend in [
+            create_test_backend(),
+            create_test_gitlab_backend(),
+            create_test_forgejo_backend(),
+        ] {
+            let backend_type = backend.ba.backend_type();
+            let resolved = backend.options(&opts);
+
+            // Accessors the three resolve_*_asset_url_for_target functions read.
+            assert_eq!(
+                resolved.matching(),
+                Some("oxlint"),
+                "matching() must be readable for {backend_type:?}"
+            );
+            assert_eq!(
+                resolved.matching_regex(),
+                Some("^oxlint-"),
+                "matching_regex() must be readable for {backend_type:?}"
+            );
+
+            // Both keys must round-trip to the lockfile for every git backend so a
+            // relock on another platform reproduces the same asset selection.
+            let lf = resolved.lockfile_options(&target);
+            assert_eq!(
+                lf.get("matching").map(String::as_str),
+                Some("oxlint"),
+                "matching must round-trip to lockfile for {backend_type:?}"
+            );
+            assert_eq!(
+                lf.get("matching_regex").map(String::as_str),
+                Some("^oxlint-"),
+                "matching_regex must round-trip to lockfile for {backend_type:?}"
+            );
+
+            // Cache-keying: a stale cached filter must never silently override
+            // mise.toml, so both keys must be install-time keys for every type
+            // (gitlab/forgejo inherit github's list via the routing in mod.rs).
+            let itk = crate::backend::install_time_option_keys_for_type(&backend_type);
+            assert!(
+                itk.contains(&"matching".to_string())
+                    && itk.contains(&"matching_regex".to_string()),
+                "matching/matching_regex must be install-time keys for {backend_type:?}"
+            );
+            // ...including the per-platform `platforms.<target>.matching` form the
+            // stale-cache check uses.
+            assert!(
+                crate::backend::is_install_time_option_key_for_type(&backend_type, "matching")
+                    && crate::backend::is_install_time_option_key_for_type(
+                        &backend_type,
+                        "platforms.linux-x64.matching"
+                    ),
+                "is_install_time_option_key_for_type must report matching for {backend_type:?}"
+            );
+        }
     }
 
     #[test]
@@ -1748,14 +2677,14 @@ mod tests {
 
     #[test]
     fn test_is_slsa_format_issue_no_attestations() {
-        let err = sigstore_verification::AttestationError::NoAttestations;
+        let err = crate::github::sigstore::AttestationError::NoAttestations;
         assert!(is_slsa_format_issue(&err));
     }
 
     #[test]
     fn test_is_slsa_format_issue_invalid_format() {
         // This is the exact error from BuildKit raw provenance files parsed line-by-line
-        let err = sigstore_verification::AttestationError::Verification(
+        let err = crate::github::sigstore::AttestationError::Verification(
             "File does not contain valid attestations or SLSA provenance".to_string(),
         );
         assert!(is_slsa_format_issue(&err));
@@ -1763,7 +2692,7 @@ mod tests {
 
     #[test]
     fn test_is_slsa_format_issue_no_certificate() {
-        let err = sigstore_verification::AttestationError::Verification(
+        let err = crate::github::sigstore::AttestationError::Verification(
             "No certificate found in attestation bundle".to_string(),
         );
         assert!(is_slsa_format_issue(&err));
@@ -1771,7 +2700,7 @@ mod tests {
 
     #[test]
     fn test_is_slsa_format_issue_no_dsse_envelope() {
-        let err = sigstore_verification::AttestationError::Verification(
+        let err = crate::github::sigstore::AttestationError::Verification(
             "Bundle has neither DSSE envelope nor message signature".to_string(),
         );
         assert!(is_slsa_format_issue(&err));
@@ -1780,7 +2709,7 @@ mod tests {
     #[test]
     fn test_is_slsa_format_issue_real_verification_failure() {
         // Digest mismatch = real verification failure, NOT a format issue
-        let err = sigstore_verification::AttestationError::Verification(
+        let err = crate::github::sigstore::AttestationError::Verification(
             "Artifact digest mismatch: expected abc123".to_string(),
         );
         assert!(!is_slsa_format_issue(&err));
@@ -1789,7 +2718,7 @@ mod tests {
     #[test]
     fn test_is_slsa_format_issue_signature_failure() {
         // Signature verification failure = real failure, NOT a format issue
-        let err = sigstore_verification::AttestationError::Verification(
+        let err = crate::github::sigstore::AttestationError::Verification(
             "P-256 signature verification failed: invalid signature".to_string(),
         );
         assert!(!is_slsa_format_issue(&err));
@@ -1797,7 +2726,39 @@ mod tests {
 
     #[test]
     fn test_is_slsa_format_issue_api_error() {
-        let err = sigstore_verification::AttestationError::Api("connection refused".to_string());
+        let err = crate::github::sigstore::AttestationError::Api("connection refused".to_string());
         assert!(!is_slsa_format_issue(&err));
+    }
+
+    #[test]
+    fn test_is_slsa_format_issue_sigstore_missing_field() {
+        // mise-sigstore maps sigstore-verify's "missing field …" JSON parse
+        // failures into the Sigstore variant. Treat those as format issues.
+        let err = crate::github::sigstore::AttestationError::Sigstore(
+            "JSON error: missing field `verificationMaterial` at line 1 column 8480".to_string(),
+        );
+        assert!(is_slsa_format_issue(&err));
+    }
+
+    #[test]
+    fn test_is_slsa_format_issue_unsupported_format() {
+        let err = crate::github::sigstore::AttestationError::UnsupportedFormat(
+            "Not an SLSA provenance predicate: https://in-toto.io/Statement/v1".to_string(),
+        );
+        assert!(is_slsa_format_issue(&err));
+    }
+
+    #[test]
+    fn test_attestations_supported_default_api() {
+        assert!(attestations_supported("https://api.github.com"));
+        // Trailing slashes are common when users hand-write api_url
+        assert!(attestations_supported("https://api.github.com/"));
+    }
+
+    #[test]
+    fn test_attestations_supported_custom_api_url() {
+        assert!(!attestations_supported("https://ghe.example.com/api/v3"));
+        assert!(!attestations_supported("https://gitlab.com/api/v4"));
+        assert!(!attestations_supported("https://codeberg.org/api/v1"));
     }
 }

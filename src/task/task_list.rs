@@ -1,4 +1,4 @@
-use crate::config::{self, Config, Settings};
+use crate::config::{self, Config};
 use crate::file::display_path;
 use crate::task::{
     GetMatchingExt, Task, TaskLoadContext, extract_monorepo_path, resolve_task_pattern,
@@ -9,12 +9,15 @@ use crate::{dirs, file};
 use console::Term;
 use demand::{DemandOption, Select};
 use eyre::{Result, bail, ensure, eyre};
-use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use itertools::Itertools;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::iter::once;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use crate::fuzzy::{FuzzyMatcher, FuzzyPattern};
+
+const MAX_AVAILABLE_TASKS_IN_ERROR: usize = 20;
 
 /// Find non-executable files in task include directories.
 /// These are files that likely should be tasks but are missing the executable bit.
@@ -49,20 +52,6 @@ pub fn split_task_spec(spec: &str) -> (&str, Vec<String>) {
 
 /// Validate that monorepo features are properly configured
 fn validate_monorepo_setup(config: &Arc<Config>) -> Result<()> {
-    // Check if experimental mode is enabled
-    if !Settings::get().experimental {
-        bail!(
-            "Monorepo task paths (like `//path:task` or `:task`) require experimental mode.\n\
-            \n\
-            To enable experimental features, set:\n\
-            {}\n\
-            \n\
-            Or run with: {}",
-            style::eyellow("  export MISE_EXPERIMENTAL=true"),
-            style::eyellow("MISE_EXPERIMENTAL=1 mise run ...")
-        );
-    }
-
     // Check if a monorepo root is configured
     if !config.is_monorepo() {
         bail!(
@@ -73,10 +62,8 @@ fn validate_monorepo_setup(config: &Arc<Config>) -> Result<()> {
             \n\
             Then create task files in subdirectories that will be automatically discovered.\n\
             See {} for more information.",
-            style::eyellow("  experimental_monorepo_root = true"),
-            style::eunderline(
-                "https://mise.jdx.dev/tasks/task-configuration.html#monorepo-support"
-            )
+            style::eyellow("  monorepo_root = true"),
+            style::eunderline("https://mise.en.dev/tasks/task-configuration.html#monorepo-support")
         );
     }
 
@@ -87,27 +74,114 @@ fn validate_monorepo_setup(config: &Arc<Config>) -> Result<()> {
 fn suggest_similar_commands(name: &str) -> Vec<String> {
     use clap::CommandFactory;
     let cmd = crate::cli::Cli::command();
-    let matcher = SkimMatcherV2::default().use_cache(true).smart_case();
+    let mut matcher = FuzzyMatcher::default();
+    let pattern = FuzzyPattern::new(name);
     cmd.get_subcommands()
         .flat_map(|s| std::iter::once(s.get_name()).chain(s.get_all_aliases()))
         .filter_map(|subcmd| {
             matcher
-                .fuzzy_match(subcmd, name)
-                .filter(|&score| score > 0)
+                .score_pattern(subcmd, &pattern)
                 .map(|score| (score, subcmd.to_string()))
         })
-        .sorted_by_key(|(score, _)| -1 * *score)
+        .sorted_by_key(|(score, _)| std::cmp::Reverse(*score))
         .take(3)
         .map(|(_, subcmd)| subcmd)
         .collect()
+}
+
+async fn tasks_for_missing_task_error(
+    config: &Config,
+    name: &str,
+) -> Result<(Arc<BTreeMap<String, Task>>, bool)> {
+    // In monorepos, users usually need `tasks ls --all` after a miss. Load that
+    // same view for the error so sibling package tasks can be suggested.
+    if (name.starts_with("//") || config.is_monorepo())
+        && let Ok(all_tasks) = config
+            .tasks_with_context(Some(&TaskLoadContext::all()))
+            .await
+        && !all_tasks.is_empty()
+    {
+        return Ok((all_tasks, true));
+    }
+
+    let tasks = config.tasks().await?;
+    Ok((tasks, false))
+}
+
+fn similar_tasks(name: &str, tasks: &BTreeMap<String, Task>) -> Vec<String> {
+    let candidates = tasks
+        .values()
+        .filter(|t| !t.hide)
+        .map(|t| t.display_name.clone())
+        .unique()
+        .collect_vec();
+    xx::suggest::similar_n_with_threshold(name, &candidates, 5, 0.75)
+}
+
+fn append_available_tasks(
+    err_msg: &mut String,
+    tasks: &BTreeMap<String, Task>,
+    showing_all_tasks: bool,
+) {
+    let visible_tasks = tasks
+        .values()
+        .filter(|t| !t.hide)
+        .sorted_by(|a, b| a.display_name.cmp(&b.display_name))
+        .unique_by(|t| t.display_name.clone())
+        .collect_vec();
+    if visible_tasks.is_empty() {
+        return;
+    }
+
+    let listed_tasks = visible_tasks
+        .iter()
+        .take(MAX_AVAILABLE_TASKS_IN_ERROR)
+        .collect_vec();
+    let name_width = listed_tasks
+        .iter()
+        .map(|t| t.display_name.len())
+        .chain(once("Name".len()))
+        .max()
+        .unwrap_or("Name".len());
+
+    if showing_all_tasks {
+        err_msg.push_str("\n\nAvailable tasks (`mise tasks ls --all`):");
+    } else {
+        err_msg.push_str("\n\nAvailable tasks:");
+    }
+    err_msg.push_str(&format!(
+        "\n  {:name_width$}  Description",
+        "Name",
+        name_width = name_width
+    ));
+    for task in listed_tasks {
+        let desc = task.description.lines().next().unwrap_or_default();
+        err_msg.push_str(&format!(
+            "\n  {:name_width$}  {}",
+            task.display_name,
+            desc,
+            name_width = name_width
+        ));
+    }
+
+    let remaining = visible_tasks
+        .len()
+        .saturating_sub(MAX_AVAILABLE_TASKS_IN_ERROR);
+    if remaining > 0 {
+        let noun = if remaining == 1 { "task" } else { "tasks" };
+        err_msg.push_str(&format!(
+            "\n  ... and {remaining} more {noun}. Run `mise tasks ls --all` to list all tasks."
+        ));
+    }
 }
 
 /// Show an error when a task is not found, with helpful suggestions
 async fn err_no_task(config: &Config, name: &str) -> Result<()> {
     // Check early if the name looks like a mistyped CLI subcommand
     let similar_cmds = suggest_similar_commands(name);
+    let (tasks_for_error, showing_all_tasks) = tasks_for_missing_task_error(config, name).await?;
 
-    if config.tasks().await.is_ok_and(|t| t.is_empty()) {
+    if tasks_for_error.is_empty() {
         // If the name matches a CLI subcommand closely, suggest that instead of
         // the confusing "no tasks defined" message
         if !similar_cmds.is_empty() {
@@ -120,15 +194,19 @@ async fn err_no_task(config: &Config, name: &str) -> Result<()> {
         }
 
         // Check if there are any untrusted config files in the current directory
-        // that might contain tasks
+        // that might contain tasks.
         if let Some(cwd) = &*dirs::CWD {
             use crate::config::config_file::{config_trust_root, is_trusted};
-            use crate::config::config_files_in_dir;
+            use crate::config::{config_files_in_dir, is_tool_versions_file};
 
             let config_files = config_files_in_dir(cwd);
             let untrusted_configs: Vec<_> = config_files
                 .iter()
-                .filter(|p| !is_trusted(&config_trust_root(p)) && !is_trusted(p))
+                .filter(|p| {
+                    !is_tool_versions_file(p)
+                        && !is_trusted(&config_trust_root(p))
+                        && !is_trusted(p)
+                })
                 .collect();
 
             if !untrusted_configs.is_empty() {
@@ -138,7 +216,7 @@ async fn err_no_task(config: &Config, name: &str) -> Result<()> {
                     .collect::<Vec<_>>()
                     .join(", ");
                 bail!(
-                    "Config file(s) in {} are not trusted: {}\nTrust them with `mise trust`. See https://mise.jdx.dev/cli/trust.html for more information.",
+                    "Config file(s) in {} are not trusted: {}\nTrust them with `mise trust`. See https://mise.en.dev/cli/trust.html for more information.",
                     display_path(cwd),
                     paths
                 );
@@ -149,7 +227,7 @@ async fn err_no_task(config: &Config, name: &str) -> Result<()> {
         if !cfg!(windows)
             && let Some(cwd) = &*dirs::CWD
         {
-            let includes = config::task_includes_for_dir(cwd, &config.config_files);
+            let includes = config::task_includes_for_dir(cwd, &config.config_files)?;
             let non_exec_files = find_non_executable_task_files(&includes);
             if !non_exec_files.is_empty() {
                 let dirs_with_files: Vec<String> = includes
@@ -180,7 +258,7 @@ async fn err_no_task(config: &Config, name: &str) -> Result<()> {
         );
     }
     if let Some(cwd) = &*dirs::CWD {
-        let includes = config::task_includes_for_dir(cwd, &config.config_files);
+        let includes = config::task_includes_for_dir(cwd, &config.config_files)?;
         let path = includes
             .iter()
             .map(|d| d.join(name))
@@ -204,32 +282,12 @@ async fn err_no_task(config: &Config, name: &str) -> Result<()> {
 
     // Suggest similar tasks using fuzzy matching for monorepo tasks
     let mut err_msg = format!("no task {} found", style::ered(name));
-    if name.starts_with("//") {
-        // Load ALL monorepo tasks for suggestions
-        if let Ok(tasks) = config
-            .tasks_with_context(Some(&TaskLoadContext::all()))
-            .await
-        {
-            let matcher = SkimMatcherV2::default().use_cache(true).smart_case();
-            let similar: Vec<String> = tasks
-                .keys()
-                .filter(|k| k.starts_with("//"))
-                .filter_map(|k| {
-                    matcher
-                        .fuzzy_match(&k.to_lowercase(), &name.to_lowercase())
-                        .map(|score| (score, k.clone()))
-                })
-                .sorted_by_key(|(score, _)| -1 * *score)
-                .take(5)
-                .map(|(_, k)| k)
-                .collect();
 
-            if !similar.is_empty() {
-                err_msg.push_str("\n\nDid you mean one of these?");
-                for task_name in similar {
-                    err_msg.push_str(&format!("\n  - {}", task_name));
-                }
-            }
+    let similar = similar_tasks(name, &tasks_for_error);
+    if !similar.is_empty() {
+        err_msg.push_str("\n\nDid you mean one of these?");
+        for task_name in similar {
+            err_msg.push_str(&format!("\n  - {}", task_name));
         }
     }
 
@@ -239,6 +297,8 @@ async fn err_no_task(config: &Config, name: &str) -> Result<()> {
             err_msg.push_str(&format!("\n  mise {cmd_name}"));
         }
     }
+
+    append_available_tasks(&mut err_msg, &tasks_for_error, showing_all_tasks);
 
     bail!(err_msg);
 }
@@ -250,7 +310,7 @@ async fn prompt_for_task() -> Result<Task> {
     ensure!(
         !tasks.is_empty(),
         "no tasks defined. see {url}",
-        url = style::eunderline("https://mise.jdx.dev/tasks/")
+        url = style::eunderline("https://mise.en.dev/tasks/")
     );
     let theme = crate::ui::theme::get_theme();
     let mut s = Select::new("Tasks")
@@ -342,7 +402,7 @@ pub async fn get_task_lists(
 
         // A path starting with "//" on Windows will be treated as a UNC path by
         // PathBuf, but "//" in UNIX will be collapsed to "/" by PathBuf.
-        // Checking a non-existent UNC path for Windows will incur a large
+        // Checking a nonexistent UNC path for Windows will incur a large
         // hiccup (~2.8s) due to Windows trying to resolve the UNC path.
         let t_for_path_check = t
             .strip_prefix("//")

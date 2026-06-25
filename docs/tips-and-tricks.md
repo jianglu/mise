@@ -7,7 +7,7 @@ An assortment of helpful tips for using `mise`.
 If you have a need to run tools as x86_64 on Apple Silicon, this can be done with mise however you'll currently
 need to use the x86_64 version of mise itself. A common reason for doing this is to support compiling node <=14.
 
-You can do this either with the [`MISE_ARCH`](https://mise.jdx.dev/configuration/settings.html#arch)
+You can do this either with the [`MISE_ARCH`](https://mise.en.dev/configuration/settings.html#arch)
 setting or by using a dedicated rosetta mise bin as described below:
 
 First, you'll need a copy of mise that's built for x86_64:
@@ -57,6 +57,91 @@ This file contains checksums so it's more secure to commit it into your project 
 calling `curl https://mise.run` dynamically—though of course this means it will only fetch
 the version of mise that was current when the script was created.
 :::
+
+## Project-local task entrypoints
+
+If you want contributors to run project tasks without installing mise first, pair
+[`mise generate bootstrap`](/cli/generate/bootstrap.html) with
+[`mise generate task-stubs`](/cli/generate/task-stubs.html):
+
+```sh
+mkdir -p bin
+mise generate bootstrap --localize --write bin/mise
+mise generate task-stubs --mise-bin ./bin/mise
+./bin/test
+```
+
+The generated task stubs behave like small project commands, while `bin/mise`
+downloads and runs the pinned mise binary for the project.
+
+## Machine bootstrapping <Badge type="warning" text="experimental" />
+
+Beyond `[tools]`, mise can declare the rest of the machine setup needed for
+a project or workstation, and [`mise bootstrap`](/cli/bootstrap.html)
+converges it in one command — system packages, then repos, then dotfiles, then
+shell activation, then macOS defaults, then LaunchAgents, then systemd user
+services, then login shell, then tools, then a `bootstrap` task if you define
+one:
+
+```toml
+[bootstrap.packages]                      # OS packages (apk/apt/dnf/pacman/brew)
+"apk:build-base" = "latest"
+"apt:build-essential" = "latest"
+"brew:postgresql@17" = "latest"
+
+[bootstrap.repos]                         # git repos cloned before dotfiles
+"~/src/dotfiles" = { url = "git@github.com:jdx/dotfiles.git", ref = "main" }
+
+[dotfiles]                             # dotfiles: symlink/copy/template
+"~/.gitconfig" = { mode = "symlink" }
+"~/.config/nvim" = { mode = "symlink" }
+
+[bootstrap.mise_shell_activate]       # mise activation in shell startup files
+zprofile = "shims"
+zshrc = "activate"
+fish = "activate"
+
+[bootstrap.macos.dock]                 # friendly macOS defaults
+autohide = true
+orientation = "left"
+
+[bootstrap.macos.finder]
+show_pathbar = true
+
+[bootstrap.macos.launchd.agents.my-sync]      # macOS user LaunchAgents
+program = "~/.local/bin/my-sync"
+run_at_load = true
+
+[bootstrap.linux.systemd.units.my-sync]       # Linux systemd user services
+exec_start = "~/.local/bin/my-sync --watch"
+restart = "on-failure"
+
+[bootstrap.user]                       # current user's login shell
+login_shell = "/bin/zsh"
+
+[bootstrap.hooks.post-defaults]        # optional phase hooks
+run = "killall Dock || true"
+
+[tasks.bootstrap]                      # anything else, with tools on PATH
+run = "gh auth status || gh auth login"
+```
+
+```sh
+mise bootstrap --yes   # new laptop or container -> ready to work
+```
+
+Everything is declarative and idempotent: re-running skips whatever is
+already in its desired state, `mise bootstrap packages status --missing` and
+`mise bootstrap dotfiles status --missing` make CI checks, and nothing is ever
+applied implicitly. The exceptions are `[bootstrap.hooks]` and `[tasks.bootstrap]`,
+which are imperative commands run during `mise bootstrap` and may have side
+effects; treat hook commands as non-idempotent unless they are written to
+converge safely. See
+[Bootstrap](/bootstrap.html), [Bootstrap Packages](/bootstrap/packages/),
+[Repos](/bootstrap/repos.html), [Dotfiles](/dotfiles.html),
+[Shell Activation](/bootstrap/shell.html),
+[macOS Defaults](/bootstrap/macos-defaults.html), [launchd](/bootstrap/launchd.html),
+[systemd](/bootstrap/systemd.html), and [User Login Shell](/bootstrap/user.html).
 
 ## Installation via zsh zinit
 
@@ -114,6 +199,26 @@ Instead of manually editing `mise.toml` to add env vars, you can use [`mise set`
 mise set NODE_ENV=production
 ```
 
+## Using Tera to read unsupported version files
+
+Some project-local version files are already supported as [idiomatic version files](https://mise.en.dev/configuration.html#idiomatic-version-files). For other version files, you can use Tera templates in `mise.toml` to read the file and assign the version to the appropriate tool.
+
+For example, to use a `.hvm` file with a plain Hugo version:
+
+```toml
+[tools]
+hugo = "{{ read_file(path='.hvm') | trim }}"
+```
+
+HVM also supports versions with an `/extended` suffix. In mise, Hugo and Hugo Extended are separate tools, so strip the suffix and use `hugo-extended` instead:
+
+```toml
+[tools]
+hugo-extended = "{{ read_file(path='.hvm') | trim | replace(from='/extended', to='') }}"
+```
+
+See [Templates](/templates.html) for more details on Tera functions and filters.
+
 ## [`mise run`](/cli/run.html) shorthand
 
 As long as the task name doesn't conflict with a mise-provided command you can skip the `run` part:
@@ -126,60 +231,91 @@ mise test
 Don't do this inside of scripts because mise may add a command in a future version and could conflict with your task.
 :::
 
+## Watch tasks while editing
+
+[`mise watch`](/cli/watch.html) reruns tasks when files change. It uses
+`watchexec`, which you can install globally with mise:
+
+```sh
+mise use -g watchexec@latest
+mise watch test
+```
+
+Use `--restart` for long-running processes that should restart on changes:
+
+```sh
+mise watch --restart dev
+```
+
+## Share task catalogs
+
+For projects with a lot of tasks,
+[`task_config.includes`](/tasks/task-configuration.html#task-config-includes)
+can load task definitions from additional directories, `tasks.toml` files, or
+remote git repositories:
+
+```toml
+[task_config]
+includes = [
+  "mise-tasks",
+  "tasks.toml",
+  "git::https://github.com/myorg/shared-tasks.git//tasks?ref=v1.0.0",
+]
+```
+
+Included `tasks.toml` files use the same shape as the `[tasks]` table without
+the `[tasks.]` prefix.
+
+## Reuse task definitions with templates
+
+Experimental [task templates](/tasks/templates.html) let multiple tasks share
+common tools, environment variables, and command defaults:
+
+```toml
+[settings]
+experimental = true
+
+[task_templates."node:test"]
+tools = { node = "24", pnpm = "latest" }
+run = "pnpm test"
+
+[tasks.test]
+extends = "node:test"
+run = "pnpm test -- --watch=false"
+```
+
+This is especially useful in monorepos where each package needs similar build,
+test, or lint tasks with small local overrides.
+
+## Redact secrets from task output
+
+If a task may echo secrets in CI logs, add `redactions` to the task or config.
+The listed environment variables are replaced with `[redacted]` in task output:
+
+```toml
+redactions = ["API_KEY", "PASSWORD"]
+```
+
+Glob patterns are also supported:
+
+```toml
+redactions.env = ["SECRETS_*"]
+```
+
 ## Software verification
 
-mise provides **native software verification** for aqua tools without requiring external dependencies. For aqua tools, Cosign/Minisign signatures, SLSA provenance, and GitHub artifact attestations are verified automatically using mise's built-in implementation.
-
-For other verification needs (like GPG), you can install additional tools:
-
-```sh
-brew install gpg
-# Note: cosign and slsa-verifier are no longer needed for aqua tools
-# mise now handles verification natively
-```
-
-To configure aqua verification (all enabled by default):
-
-```sh
-# Disable specific verification methods if needed
-export MISE_AQUA_COSIGN=false
-export MISE_AQUA_SLSA=false
-export MISE_AQUA_GITHUB_ATTESTATIONS=false
-export MISE_AQUA_MINISIGN=false
-```
+See [Security](/security.html#software-verification) for mise's software verification controls,
+including aqua signatures, SLSA provenance, and GitHub artifact attestations.
 
 ## Minimum release age
 
-To limit supply chain risk, you can restrict mise to only install versions released before a certain date or duration. This is similar to Renovate's [minimum release age](https://docs.renovatebot.com/key-concepts/minimum-release-age/) concept — newly published versions are ignored until they've been available for a configurable amount of time.
-
-```toml
-# mise.toml
-[settings]
-install_before = "7d"  # only install versions released more than 7 days ago
-```
-
-Supports relative durations (`7d`, `6m`, `1y`) and absolute dates (`2024-06-01`). Only affects fuzzy version resolution (e.g., `node@20` or `latest`) — explicitly pinned versions like `node@22.5.0` bypass the filter.
-
-You can also set `install_before` per-tool to override the global setting:
-
-```toml
-# mise.toml
-[settings]
-install_before = "7d"  # default for all tools
-
-[tools.trivy]
-version = "latest"
-install_before = "1d"  # trivy updates are time-sensitive, use a shorter window
-```
-
-Precedence: `--before` CLI flag > per-tool `install_before` > global `install_before` setting.
-
-See [`install_before`](/configuration/settings.html#install_before) for more details.
+See [Security](/security.html#minimum-release-age) for supply-chain delay controls, backend support,
+and transitive dependency filtering behavior.
 
 ## [`mise up --bump`](/cli/upgrade.html)
 
 Use `mise up --bump` to upgrade all software to the latest version and update `mise.toml` files. This keeps the same semver range as before,
-so if you had `node = "22"` and node 24 is the latest, `mise up --bump node` will change `mise.toml` to `node = "24"`.
+so if you had `node = "24"` and node 26 is the latest, `mise up --bump node` will change `mise.toml` to `node = "26"`.
 
 ## cargo-binstall
 

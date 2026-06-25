@@ -22,6 +22,96 @@ The version will be set in `~/.config/mise/config.toml` with the following forma
 "gitlab:gitlab-org/gitlab-runner" = { version = "latest", asset_pattern = "gitlab-runner-linux-x64" }
 ```
 
+## Authentication
+
+For private repositories or higher API limits, mise supports several GitLab token sources.
+
+### Token priority
+
+mise checks these sources in order and uses the first token found:
+
+1. `MISE_GITLAB_ENTERPRISE_TOKEN` (for non-`gitlab.com` hosts)
+2. `MISE_GITLAB_TOKEN`
+3. `GITLAB_TOKEN`
+4. `credential_command` (if set)
+5. `gitlab_tokens.toml` (per host)
+6. glab CLI config (`config.yml`, if enabled)
+7. `git credential fill` (if `gitlab.use_git_credentials=true`)
+
+### Environment variables
+
+```sh
+export MISE_GITLAB_TOKEN="glpat-xxxxxxxx"
+```
+
+For self-hosted GitLab instances:
+
+```sh
+export MISE_GITLAB_ENTERPRISE_TOKEN="glpat-yyyyyyyy"
+```
+
+### Token file (`gitlab_tokens.toml`)
+
+```toml
+# ~/.config/mise/gitlab_tokens.toml
+[tokens."gitlab.com"]
+token = "glpat-xxxxxxxx"
+
+[tokens."gitlab.mycompany.com"]
+token = "glpat-yyyyyyyy"
+```
+
+### `credential_command`
+
+You can provide a shell command that prints a token to stdout:
+
+```toml
+[settings.gitlab]
+credential_command = "op read 'op://Private/GitLab Token/credential'"
+```
+
+mise executes this command with the configured default inline shell. The target hostname is available as `MISE_CREDENTIAL_HOST`, and the provider name (`gitlab`) is available as `MISE_CREDENTIAL_PROVIDER`. For compatibility, recognized sh-compatible shells (`ash`, `bash`, `dash`, `ksh`, `sh`, and `zsh`) also receive the hostname as `$1`/`${1}`.
+
+:::: warning Planned deprecation
+The legacy `$1`/`${1}` hostname argument is deprecated. Use `MISE_CREDENTIAL_HOST` instead. mise will start warning in `2026.11.0`, and `$1` compatibility will be removed in `2027.11.0`.
+::::
+
+### glab CLI integration
+
+mise can read tokens from [glab](https://gitlab.com/gitlab-org/cli) config as a fallback. It checks:
+
+1. `$GLAB_CONFIG_DIR/config.yml`
+2. `$XDG_CONFIG_HOME/glab-cli/config.yml` (defaults to `~/.config/glab-cli/config.yml`)
+3. `~/Library/Application Support/glab-cli/config.yml` (macOS)
+
+Disable this fallback with:
+
+```toml
+[settings.gitlab]
+glab_cli_tokens = false
+```
+
+### `git credential fill` fallback
+
+As a last resort, mise can query git credential helpers:
+
+```toml
+[settings.gitlab]
+use_git_credentials = true
+```
+
+This uses `git credential fill` and supports credentials stored by helpers such as macOS Keychain.
+
+### Debugging token resolution
+
+Use `mise token gitlab` to see which token mise would use for a given host:
+
+```sh
+mise token gitlab
+mise token gitlab --unmask
+mise token gitlab gitlab.mycompany.com
+```
+
 ## Tool Options
 
 The following [tool-options](/dev-tools/#tool-options) are available for the `gitlab` backend—these
@@ -44,7 +134,7 @@ mise install gitlab:user/repo
 ```
 
 ::: tip
-The autodetection logic is implemented in [`src/backend/asset_matcher.rs`](https://github.com/jdx/mise/blob/main/src/backend/asset_matcher.rs), which is shared by both the GitHub and GitLab backends.
+The autodetection logic is implemented in [`src/backend/asset_matcher.rs`](https://github.com/jdx/mise/blob/main/src/backend/asset_matcher.rs), which is shared by the GitHub, GitLab, and Forgejo backends.
 :::
 
 ### `asset_pattern`
@@ -56,6 +146,51 @@ Specifies the pattern to match against release asset names. This is useful when 
 version = "latest"
 asset_pattern = "gitlab-runner-linux-x64"
 ```
+
+### `matching`
+
+Narrows asset selection to names containing the given substring, **while keeping platform autodetection**. Unlike [`asset_pattern`](#asset_pattern) (which replaces autodetection entirely), `matching` only refines the candidate set — autodetection still chooses the correct OS/arch from the narrowed list, so a single config stays portable across platforms.
+
+This is the option to reach for when a repository ships **multiple binaries as separate per-platform assets** and autodetection can't tell which one you want.
+
+```toml
+[tools]
+# When a release ships several binaries per platform (e.g. `mytool-cli` and
+# `mytool-server`), matching picks one on every OS/arch without hardcoding a
+# platform-specific asset_pattern.
+"gitlab:owner/repo" = { version = "latest", matching = "mytool-cli" }
+```
+
+Tool options can also be passed inline on the command line using `[key=value]` syntax:
+
+```sh
+mise use "gitlab:owner/repo[matching=mytool-cli]"
+```
+
+`matching` is a case-sensitive substring test, so a value that is also a substring of another asset's name (e.g. `matching = "tool"` when both `tool-*` and `tool-extras-*` are published) won't uniquely select your binary. Use [`matching_regex`](#matching_regex) with an anchor when you need a precise match.
+
+If [`asset_pattern`](#asset_pattern) is also set, it takes precedence and `matching`/`matching_regex` are ignored — `asset_pattern` replaces autodetection entirely, so there is no candidate set left for them to narrow. They are ignored silently: when `asset_pattern` is set, a `matching_regex` is never consulted and an invalid one is not reported, since mise does not error on a superseded option.
+
+### `matching_regex`
+
+Like [`matching`](#matching), but the asset name must match the given regular expression. Use this when a substring isn't selective enough. The match is case-sensitive; use an inline `(?i)` flag for case-insensitive matching.
+
+```toml
+[tools]
+"gitlab:owner/repo" = { version = "latest", matching_regex = "^mytool-cli-" }
+```
+
+If both `matching` and `matching_regex` are set, an asset must satisfy **both** (logical AND)
+to remain a candidate.
+
+::: warning
+`matching`/`matching_regex` are **not** part of the install path — it is keyed by the tool
+name (`owner/repo`, or a `tool_alias`) and version. To install two binaries from the same
+release, give each its own [`tool_alias`](/dev-tools/backends/github.html#multiple-assets-from-the-same-release)
+so they get distinct install directories; reusing the same `gitlab:owner/repo` string with
+different `matching` values resolves to the same directory and the second install overwrites
+the first.
+:::
 
 ### `version_prefix`
 
@@ -189,6 +324,23 @@ rename_exe = "mytool"  # Rename the extracted binary to mytool
 Use `rename_exe` for archives where the binary inside has a different name than desired. Use `bin` for single binary downloads (non-archives).
 :::
 
+### `no_app`
+
+Skip macOS .app bundle assets during autodetection and prefer standalone CLI binaries instead. This is useful when a repository provides both a macOS .app bundle (often an Xcode extension or GUI application) and a standalone command-line tool:
+
+```toml
+[tools."gitlab:myorg/mytool"]
+version = "latest"
+no_app = true
+```
+
+When `no_app = true`:
+
+- Assets containing `.app.` (e.g., `Tool.app.zip`, `Tool.for.Xcode.app.zip`) are penalized during autodetection
+- Standalone archives are preferred
+- This is mainly useful for macOS asset selection; non-macOS `.app.` assets are already penalized by platform matching
+- Only affects autodetection; explicit `asset_pattern` values are used as-is
+
 ### `bin_path`
 
 ::: v-pre
@@ -226,7 +378,7 @@ When enabled:
 
 ### `api_url`
 
-For self-hosted GitLab instances, specify the API URL:
+For self-hosted GitLab instances, specify the API URL. mise uses this URL for release listing and release asset lookup, and may also use it to download assets when browser download URLs are not reachable or when using custom/private instances:
 
 ```toml
 [tools]

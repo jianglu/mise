@@ -11,7 +11,7 @@ This command uses the `watchexec` tool to watch for changes to files and rerun t
 It must be installed for this command to work, but you can install it with `mise use -g watchexec@latest`.
 
 For more advanced process management (daemon management, auto-restart, readiness checks,
-cron scheduling), see mise's sister project: https://pitchfork.jdx.dev
+cron scheduling), see mise's sister project: https://pitchfork.en.dev
 
 ## Arguments
 
@@ -200,14 +200,14 @@ repository will be discarded.
 Don't load global ignores
 
 This disables loading of global or user ignore files, like '~/.gitignore',
-'~/.config/watchexec/ignore', or '%APPDATA%\Bazzar\2.0\ignore'. Contrast with
+'~/.config/watchexec/ignore', or '%APPDATA%\Bazaar\2.0\ignore'. Contrast with
 '--no-vcs-ignore' and '--no-project-ignore'.
 
 Supported global ignore files
 
   - Git (if core.excludesFile is set): the file at that path
   - Git (otherwise): the first found of $XDG_CONFIG_HOME/git/ignore, %APPDATA%/.gitignore, %USERPROFILE%/.gitignore, $HOME/.config/git/ignore, $HOME/.gitignore.
-  - Bazaar: the first found of %APPDATA%/Bazzar/2.0/ignore, $HOME/.bazaar/ignore.
+  - Bazaar: the first found of %APPDATA%/Bazaar/2.0/ignore, $HOME/.bazaar/ignore.
   - Watchexec: the first found of $XDG_CONFIG_HOME/watchexec/ignore, %APPDATA%/watchexec/ignore, %USERPROFILE%/.watchexec/ignore, $HOME/.watchexec/ignore.
 
 Like for project files, Git and Bazaar global files will only be used for the corresponding

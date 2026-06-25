@@ -39,37 +39,41 @@ For toolbox containers or bastion hosts where tools should be pre-installed for 
 use `mise install --system` to install tools into `/usr/local/share/mise/installs`.
 Each user's mise will automatically find these system-level tools without any configuration.
 
+The following example also shows installing using `extrepo` on Debian/Ubuntu image.
+With this approach you cannot specify `MISE_VERSION` or `MISE_INSTALL_PATH`.
+
 ```Dockerfile [Dockerfile]
+# syntax=docker/dockerfile:1
 FROM debian:13-slim
 
-RUN apt-get update  \
-    && apt-get -y --no-install-recommends install  \
-        sudo curl git ca-certificates build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-ENV MISE_INSTALL_PATH="/usr/local/bin/mise"
-
-# Install mise
-RUN curl https://mise.run | sh
+RUN <<EOF
+  set -ex
+  apt-get update
+  apt-get install -y extrepo
+  extrepo enable mise
+  apt-get remove -y --auto-remove extrepo # extrepo and its deps are not needed after extrepo enable
+  apt-get update
+  apt-get install -y mise build-essential
+  rm -fr /var/lib/apt/lists/*
+EOF
 
 # Pre-install tools to the system-wide shared directory
-RUN mise install --system node@22 python@3.13
+RUN mise install --system node@26 python@3.15
 ```
 
 Users in the container will see these tools automatically:
 
 ```shell
 $ mise ls
-node    22.0.0 (system)
-python  3.13.0 (system)
+node    26.0.0 (system)
+python  3.15.0 (system)
 ```
 
 Users can install additional versions in their own directory — those take priority over
 system versions. To customize the system directory, set `MISE_SYSTEM_DATA_DIR`.
 
 You can also configure additional shared directories with `MISE_SHARED_INSTALL_DIRS`
-(colon-separated paths) or the `shared_install_dirs` setting.
+(paths separated by `:` on Unix and `;` on Windows) or the `shared_install_dirs` setting.
 
 ### Devcontainers with home directory mounts
 
@@ -83,28 +87,28 @@ this path is outside `~` and survives home directory mounts:
 ```Dockerfile [Dockerfile]
 FROM debian:13-slim
 # ... install mise ...
-RUN mise install --system node@22 python@3.13
+RUN mise install --system node@26 python@3.15
 ```
 
 When the container starts with `~` mounted, users still see the system tools automatically.
 Any tools they install normally go to `~/.local/share/mise/installs` (on the mount) and
 take priority over system versions.
 
-## Overriding libc detection with MISE_LIBC
+## Overriding libc detection
 
 In minimal Docker images (scratch, busybox, distroless) where no dynamic linker
-files exist, mise may not detect whether the system uses musl or glibc. Set `MISE_LIBC`
-to force the detection:
+files exist, mise may not detect whether the system uses musl or glibc. Set `libc`
+or `MISE_LIBC` to force the detection:
 
 ```Dockerfile
 ENV MISE_LIBC=musl
 RUN mise install
 ```
 
-Valid values are `musl` and `gnu` (case-insensitive). Invalid values are silently
-ignored and mise falls back to runtime detection. When the mise binary is compiled
-for musl (the default for Linux releases), it will also fall back to musl
-automatically when no linker is detected.
+Valid values are `musl`, `glibc`, and `gnu` (case-insensitive, with `gnu` treated
+as glibc). Invalid values are silently ignored and mise falls back to runtime
+detection. When the mise binary is compiled for musl (the default for Linux
+releases), it will also fall back to musl automatically when no linker is detected.
 
 ## Task to run mise in a Docker container
 

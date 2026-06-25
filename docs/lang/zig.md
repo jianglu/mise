@@ -32,6 +32,15 @@ command will list available Mach versions:
 curl https://machengine.org/zig/index.json | yq 'keys'
 ```
 
+### `master` (nightly channel)
+
+`zig@master` tracks a moving nightly. mise resolves it to the concrete dev version
+it currently points at (e.g. `0.17.0-dev.836+...`) at install time, so the install
+lands in a versioned directory and `mise upgrade zig` / `mise outdated` pick up
+newer nightlies — instead of the channel staying pinned to the build it was first
+installed from. Run `mise upgrade zig` (or `mise install -f zig@master`) to move to
+the current nightly.
+
 ## zig Language Server
 
 The `zig` language server ([zls](https://github.com/zigtools/zls)) needs to be installed separately.
@@ -44,6 +53,20 @@ mise use -g zls@latest # install latest zls release
 
 Note that a tagged release of `zig` should be used with
 the same tagged release of `zls`. Currently there is no Mach version of `zls`.
+
+## Tool Options
+
+The following [tool-options](/dev-tools/#tool-options) are available for the `zig` backend.
+These options go in the `[tools]` section in `mise.toml`.
+
+### `install_env`
+
+Set environment variables for install-time commands run by the core `zig` backend:
+
+```toml
+[tools]
+zig = { version = "latest", install_env = { HTTPS_PROXY = "http://proxy.example" } }
+```
 
 ## Settings
 

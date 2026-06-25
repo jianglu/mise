@@ -9,7 +9,7 @@ use crate::{config, duration, file};
 ///
 /// This modifies the contents of ~/.config/mise/config.toml by default.
 /// With `--local`, modifies the local config file instead.
-/// See https://mise.jdx.dev/configuration.html#target-file-for-write-operations
+/// See https://mise.en.dev/configuration.html#target-file-for-write-operations
 #[derive(Debug, clap::Args)]
 #[clap(visible_aliases = ["create"], after_long_help = AFTER_LONG_HELP, verbatim_doc_comment)]
 pub struct SettingsSet {
@@ -68,7 +68,9 @@ pub fn set(mut key: &str, value: &str, add: bool, local: bool) -> Result<()> {
     let raw = file::read_to_string(&path).unwrap_or_default();
     let mut config: DocumentMut = raw.parse()?;
     if !config.contains_key("settings") {
-        config["settings"] = toml_edit::Item::Table(toml_edit::Table::new());
+        let mut settings = toml_edit::Table::new();
+        settings.set_implicit(true);
+        config["settings"] = toml_edit::Item::Table(settings);
     }
     if let Some(mut settings) = config["settings"].as_table_mut() {
         if let Some((parent_key, child_key)) = key.split_once('.') {
@@ -84,8 +86,9 @@ pub fn set(mut key: &str, value: &str, add: bool, local: bool) -> Result<()> {
                 .unwrap();
         }
 
-        let value = match settings.get(key).map(|c| c.as_array()) {
-            Some(Some(array)) if add => {
+        let value = match settings.get(key) {
+            Some(current) if add && current.as_array().is_some() => {
+                let array = current.as_array().unwrap();
                 let mut new_array = array.clone();
                 new_array.extend(value.as_array().unwrap().iter().cloned());
                 match meta.type_ {

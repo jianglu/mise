@@ -112,15 +112,15 @@ impl ToolsetBuilder {
         }
         for (k, v) in env {
             if k.starts_with("MISE_") && k.ends_with("_VERSION") && k != "MISE_VERSION" {
-                let plugin_name = k
+                let tool_name = k
                     .trim_start_matches("MISE_")
                     .trim_end_matches("_VERSION")
                     .to_lowercase();
-                if plugin_name == "install" {
-                    // ignore MISE_INSTALL_VERSION
+                if tool_name == "install" || tool_name == "tool" {
+                    // ignore MISE_INSTALL_VERSION and MISE_TOOL_VERSION (set during hooks)
                     continue;
                 }
-                let ba: Arc<BackendArg> = Arc::new(plugin_name.as_str().into());
+                let ba: Arc<BackendArg> = Arc::new(tool_name.as_str().into());
                 let source = ToolSource::Environment(k, v.clone());
                 let mut env_ts = Toolset::new(source.clone());
                 for v in v.split_whitespace() {
@@ -136,9 +136,20 @@ impl ToolsetBuilder {
     fn load_runtime_args(&self, ts: &mut Toolset) -> eyre::Result<()> {
         for (_, args) in self.args.iter().into_group_map_by(|arg| arg.ba.clone()) {
             let mut arg_ts = Toolset::new(ToolSource::Argument);
+            // carry over options (e.g. filter_bins) from config for this tool
+            let config_options = ts
+                .versions
+                .get(&args[0].ba)
+                .and_then(|tvl| tvl.requests.first())
+                .map(|tvr| tvr.options());
+            let apply_arg_options = |mut tvr: ToolRequest, ba: &BackendArg| {
+                tvr.set_options(ba.opts_with_config(config_options.clone()));
+                tvr
+            };
             for arg in args {
                 if let Some(tvr) = &arg.tvr {
-                    arg_ts.add_version(tvr.clone());
+                    let tvr = apply_arg_options(tvr.clone(), arg.ba.as_ref());
+                    arg_ts.add_version(tvr);
                 } else if self.default_to_latest {
                     // this logic is required for `mise x` because with that specific command mise
                     // should default to installing the "latest" version if no version is specified
@@ -152,18 +163,18 @@ impl ToolsetBuilder {
 
                     if let Some(current_active) = current_active {
                         // active version, so don't set "latest"
-                        arg_ts.add_version(ToolRequest::new(
+                        let tvr = ToolRequest::new(
                             arg.ba.clone(),
                             &current_active.version(),
                             ToolSource::Argument,
-                        )?);
+                        )?;
+                        let tvr = apply_arg_options(tvr, arg.ba.as_ref());
+                        arg_ts.add_version(tvr);
                     } else {
                         // no active version, so use "latest"
-                        arg_ts.add_version(ToolRequest::new(
-                            arg.ba.clone(),
-                            "latest",
-                            ToolSource::Argument,
-                        )?);
+                        let tvr = ToolRequest::new(arg.ba.clone(), "latest", ToolSource::Argument)?;
+                        let tvr = apply_arg_options(tvr, arg.ba.as_ref());
+                        arg_ts.add_version(tvr);
                     }
                 }
             }

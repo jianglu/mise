@@ -8,7 +8,7 @@ export MISE_EXPERIMENTAL=1
 
 # Set up monorepo structure
 cat <<'EOF' >mise.toml
-experimental_monorepo_root = true
+monorepo_root = true
 
 [monorepo]
 config_roots = ["mydir"]
@@ -46,9 +46,9 @@ assert_contains "mise tasks deps //:root" "//mydir:child"
 
 # Test from subdirectory - should still work with full monorepo paths
 (
-	cd mydir
-	assert_contains "mise tasks deps //mydir:child" "//mydir:child"
-	assert_contains "mise tasks deps //mydir:grandchild" "//mydir:grandchild"
+  cd mydir
+  assert_contains "mise tasks deps //mydir:child" "//mydir:child"
+  assert_contains "mise tasks deps //mydir:grandchild" "//mydir:grandchild"
 )
 
 # Test shorthand from root

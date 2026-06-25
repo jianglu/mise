@@ -3,7 +3,7 @@ use crate::env_diff::EnvMap;
 use crate::exit::exit;
 use crate::shell::ShellType;
 use crate::task::Task;
-use crate::tera::get_tera;
+use crate::tera::{contains_template_syntax, get_tera, render_str};
 use eyre::{Context, Result};
 use heck::ToSnakeCase;
 use indexmap::IndexMap;
@@ -64,7 +64,7 @@ impl TaskScriptParser {
         script: &str,
         ctx: &tera::Context,
     ) -> Result<String> {
-        tera.render_str(script.trim(), ctx)
+        render_str(tera, script.trim(), ctx)
             .with_context(|| format!("Failed to render task script: {}", script))
     }
 
@@ -73,7 +73,7 @@ impl TaskScriptParser {
         usage: &str,
         ctx: &tera::Context,
     ) -> Result<String> {
-        tera.render_str(usage.trim(), ctx)
+        render_str(tera, usage.trim(), ctx)
             .with_context(|| format!("Failed to render task usage: {}", usage))
     }
 
@@ -92,7 +92,7 @@ impl TaskScriptParser {
             "2027.5.0",
             "tera_template_task_args",
             "Task '{}' uses deprecated Tera template functions (arg(), option(), flag()) in run scripts. \
-             Use the 'usage' field instead. See https://mise.jdx.dev/tasks/task-arguments.html",
+             Use the 'usage' field instead. See https://mise.en.dev/tasks/task-arguments.html",
             task_name
         );
     }
@@ -500,22 +500,31 @@ impl TaskScriptParser {
         });
 
         tera.register_function("task_source_files", {
-            let sources = Arc::new(task.sources.clone());
+            let glob_patterns = Arc::new(
+                crate::task::task_source_checker::source_glob_patterns(&task.sources),
+            );
+            // Anchor the matcher at the process cwd. `is_source` handles
+            // absolute paths outside this root by trusting the glob result,
+            // so absolute outside-cwd patterns (e.g. workspace-root paths)
+            // still flow through.
+            let cwd = crate::dirs::CWD
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let matcher = Arc::new(crate::task::task_source_checker::build_source_matcher(
+                &cwd,
+                &task.sources,
+            ));
 
             move |_: &HashMap<String, tera::Value>| -> tera::Result<tera::Value> {
-               if sources.is_empty() {
+               if glob_patterns.is_empty() {
                    trace!("tera::render::resolve_task_sources `task_source_files` called in task with empty sources array");
                    return Ok(tera::Value::Array(Default::default()));
                };
 
-                let mut resolved = Vec::with_capacity(sources.len());
+                let mut resolved = Vec::with_capacity(glob_patterns.len());
 
-                for pattern in sources.iter() {
-                    // pattern is considered a tera template string if it contains opening tags:
-                    // - "{#" for comments
-                    // - "{{" for expressions
-                    // - "{%" for statements
-                    if pattern.contains("{#") || pattern.contains("{{") || pattern.contains("{%") {
+                for pattern in glob_patterns.iter() {
+                    if contains_template_syntax(pattern) {
                         trace!(
                             "tera::render::resolve_task_sources including tera template string in resolved task sources: {pattern}"
                         );
@@ -545,6 +554,15 @@ impl TaskScriptParser {
 
                                 match path {
                                     Ok(path) => {
+                                        if !crate::task::task_source_checker::is_source(
+                                            &matcher, &path,
+                                        ) {
+                                            trace!(
+                                                "tera::render::resolve_task_sources excluded '{}' due to !-pattern",
+                                                path.display()
+                                            );
+                                            continue;
+                                        }
                                         let source = path.display();
                                         trace!(
                                             "tera::render::resolve_task_sources resolved source from pattern '{pattern}': {source}"
@@ -583,10 +601,24 @@ impl TaskScriptParser {
         task: &Task,
         scripts: &[String],
     ) -> Result<usage::Spec> {
+        let usage_has_template = contains_template_syntax(&task.usage);
+        let scripts_have_template = scripts
+            .iter()
+            .any(|script| contains_template_syntax(script));
+        if !usage_has_template
+            && (!scripts_have_template || Settings::get().task.disable_spec_from_run_scripts)
+        {
+            return task.usage.trim().parse().map_err(Into::into);
+        }
+
         let (mut tera, arg_order, input_args, input_flags) = self.setup_tera_for_spec_parsing(task);
         let mut tera_ctx = task.tera_ctx(config).await?;
         // First render the usage field to collect the spec
-        let rendered_usage = Self::render_usage_with_context(&mut tera, &task.usage, &tera_ctx)?;
+        let rendered_usage = if usage_has_template {
+            Self::render_usage_with_context(&mut tera, &task.usage, &tera_ctx)?
+        } else {
+            task.usage.trim().to_string()
+        };
         let spec_from_field: usage::Spec = rendered_usage.parse()?;
 
         if Settings::get().task.disable_spec_from_run_scripts {
@@ -602,8 +634,12 @@ impl TaskScriptParser {
         // Render scripts to trigger spec collection via Tera template functions
         // (arg/option/flag), but discard the results. Ignore rendering errors since we only
         // care about collecting arg/flag definitions from the deprecated Tera syntax.
-        for script in scripts {
-            let _ = Self::render_script_with_context(&mut tera, script, &tera_ctx);
+        if scripts_have_template {
+            for script in scripts {
+                if contains_template_syntax(script) {
+                    let _ = Self::render_script_with_context(&mut tera, script, &tera_ctx);
+                }
+            }
         }
         let mut cmd = usage::SpecCommand::default();
         // TODO: ensure no gaps in args, e.g.: 1,2,3,4,5
@@ -624,10 +660,8 @@ impl TaskScriptParser {
         // Check for deprecated Tera template args usage
         Self::check_tera_args_deprecation(&task.name, &cmd.args, &cmd.flags);
 
-        let mut spec = usage::Spec {
-            cmd,
-            ..Default::default()
-        };
+        let mut spec = usage::Spec::default();
+        spec.cmd = cmd;
         spec.merge(spec_from_field);
 
         Ok(spec)
@@ -640,6 +674,15 @@ impl TaskScriptParser {
         scripts: &[String],
         env: &EnvMap,
     ) -> Result<(Vec<String>, usage::Spec)> {
+        let usage_has_template = contains_template_syntax(&task.usage);
+        let scripts_have_template = scripts
+            .iter()
+            .any(|script| contains_template_syntax(script));
+        if !usage_has_template && !scripts_have_template {
+            let scripts = scripts.iter().map(|s| s.trim().to_string()).collect();
+            return Ok((scripts, task.usage.trim().parse()?));
+        }
+
         let (mut tera, arg_order, input_args, input_flags) = self.setup_tera_for_spec_parsing(task);
         let mut tera_ctx = task.tera_ctx(config).await?;
         self.inject_extra_vars(&mut tera_ctx);
@@ -647,15 +690,29 @@ impl TaskScriptParser {
         // First render the usage field to collect the spec and build a default
         // usage map, so that `{{ usage.* }}` references in run scripts do not
         // fail during this initial parsing phase (e.g. for inline tasks).
-        let rendered_usage = Self::render_usage_with_context(&mut tera, &task.usage, &tera_ctx)?;
+        let rendered_usage = if usage_has_template {
+            Self::render_usage_with_context(&mut tera, &task.usage, &tera_ctx)?
+        } else {
+            task.usage.trim().to_string()
+        };
         let spec_from_field: usage::Spec = rendered_usage.parse()?;
         let usage_ctx = Self::make_usage_ctx_from_spec_defaults(&spec_from_field);
         tera_ctx.insert("usage", &usage_ctx);
 
-        let scripts = scripts
-            .iter()
-            .map(|s| Self::render_script_with_context(&mut tera, s, &tera_ctx))
-            .collect::<Result<Vec<String>>>()?;
+        let scripts = if scripts_have_template {
+            scripts
+                .iter()
+                .map(|s| {
+                    if contains_template_syntax(s) {
+                        Self::render_script_with_context(&mut tera, s, &tera_ctx)
+                    } else {
+                        Ok(s.trim().to_string())
+                    }
+                })
+                .collect::<Result<Vec<String>>>()?
+        } else {
+            scripts.iter().map(|s| s.trim().to_string()).collect()
+        };
         let mut cmd = usage::SpecCommand::default();
         // TODO: ensure no gaps in args, e.g.: 1,2,3,4,5
         let arg_order = arg_order.lock().unwrap();
@@ -674,10 +731,8 @@ impl TaskScriptParser {
 
         // Check for deprecated Tera template args usage
         Self::check_tera_args_deprecation(&task.name, &cmd.args, &cmd.flags);
-        let mut spec = usage::Spec {
-            cmd,
-            ..Default::default()
-        };
+        let mut spec = usage::Spec::default();
+        spec.cmd = cmd;
         spec.merge(spec_from_field);
 
         Ok((scripts, spec))
@@ -712,8 +767,12 @@ impl TaskScriptParser {
 
         let mut out: Vec<String> = vec![];
         for script in scripts {
+            if !contains_template_syntax(script) {
+                out.push(script.trim().to_string());
+                continue;
+            }
             let shell_type = shell_from_shebang(script)
-                .or(task.shell())
+                .or(task.shell()?)
                 .unwrap_or(Settings::get().default_inline_shell()?)[0]
                 .parse()
                 .ok();
@@ -792,7 +851,9 @@ impl TaskScriptParser {
         Ok(out)
     }
 
-    fn make_usage_ctx(usage: &usage::parse::ParseOutput) -> HashMap<String, tera::Value> {
+    pub(crate) fn make_usage_ctx(
+        usage: &usage::parse::ParseOutput,
+    ) -> HashMap<String, tera::Value> {
         let mut usage_ctx: HashMap<String, tera::Value> = HashMap::new();
 
         // These values are not escaped or shell-quoted.
@@ -918,6 +979,7 @@ pub fn has_any_usage_spec(spec: &usage::Spec) -> bool {
         || spec.cmd.after_help.is_some()
         || spec.cmd.after_help_long.is_some()
         || !spec.cmd.examples.is_empty()
+        || !spec.examples.is_empty()
 }
 
 /// Extract the selected subcommand name from parsed commands.
@@ -1256,6 +1318,12 @@ mod tests {
                     "/README.md; ",
                 ),
             ),
+            // `!` excludes a previously matched file
+            (
+                &["**/filetask", "!**/filetask"],
+                "echo {{ task_source_files() }}",
+                "echo []",
+            ),
         ];
 
         for (sources, template, expected) in cases {
@@ -1300,10 +1368,8 @@ mod tests {
             long: vec!["bar".to_string()],
             ..Default::default()
         });
-        let spec = usage::Spec {
-            cmd,
-            ..Default::default()
-        };
+        let mut spec = usage::Spec::default();
+        spec.cmd = cmd;
 
         let config = Config::get().await.unwrap();
 
@@ -1373,10 +1439,8 @@ mod tests {
             var: true,
             ..Default::default()
         });
-        let spec = usage::Spec {
-            cmd,
-            ..Default::default()
-        };
+        let mut spec = usage::Spec::default();
+        spec.cmd = cmd;
 
         let config = Config::get().await.unwrap();
 
@@ -1800,5 +1864,103 @@ mod tests {
             .unwrap();
         assert_eq!(spec.cmd.args.len(), 1);
         assert_eq!(spec.cmd.flags.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_usage_example_directives() {
+        fn parse_script_from_str(script: &str) -> usage::Spec {
+            use std::io::Write;
+            let mut tmp = tempfile::NamedTempFile::new().unwrap();
+            tmp.write_all(script.as_bytes()).unwrap();
+            tmp.flush().unwrap();
+            usage::Spec::parse_script(tmp.path()).unwrap()
+        }
+
+        // Examples from #USAGE directives are parsed into spec.examples
+        let spec = parse_script_from_str(
+            "#!/usr/bin/env bash\n#USAGE flag \"--name <name>\"\n#USAGE example \"mycli --name world\" header=\"Basic usage\"\necho hello\n",
+        );
+        assert_eq!(spec.examples.len(), 1);
+        assert_eq!(spec.examples[0].code, "mycli --name world");
+        assert_eq!(spec.examples[0].header, Some("Basic usage".to_string()));
+
+        // has_any_usage_spec recognizes examples
+        assert!(has_any_usage_spec(&spec));
+
+        // Examples render in help output
+        let help = usage::docs::cli::render_help(&spec, &spec.cmd, true);
+        assert!(
+            help.contains("Examples:"),
+            "help should contain Examples section"
+        );
+        assert!(
+            help.contains("Basic usage:"),
+            "help should contain example header"
+        );
+        assert!(
+            help.contains("$ mycli --name world"),
+            "help should contain example command"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_usage_examples_survive_task_script_parser() {
+        // Verify examples from the task.usage field survive through
+        // TaskScriptParser::parse_run_scripts (the merge/processing pipeline)
+        let config = Config::get().await.unwrap();
+        let task = Task {
+            usage: "flag \"--name <name>\"\nexample \"mycli --name world\" header=\"Basic usage\""
+                .to_string(),
+            ..Default::default()
+        };
+        let parser = TaskScriptParser::new(None);
+        let (_scripts, spec) = parser
+            .parse_run_scripts(
+                &config,
+                &task,
+                &["echo hello".to_string()],
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+
+        // Examples should survive the merge into the final spec
+        assert_eq!(
+            spec.examples.len(),
+            1,
+            "examples should survive TaskScriptParser pipeline"
+        );
+        assert_eq!(spec.examples[0].code, "mycli --name world");
+        assert_eq!(spec.examples[0].header, Some("Basic usage".to_string()));
+
+        // And render in help output
+        let help = usage::docs::cli::render_help(&spec, &spec.cmd, true);
+        assert!(
+            help.contains("Examples:"),
+            "help should contain Examples section"
+        );
+    }
+
+    #[test]
+    fn test_has_any_usage_spec_examples_only() {
+        // A script with only examples (no flags or args) should be recognized
+        // as having usage directives. This exercises the spec.examples check in
+        // has_any_usage_spec (distinct from spec.cmd.examples).
+        fn parse_script_from_str(script: &str) -> usage::Spec {
+            use std::io::Write;
+            let mut tmp = tempfile::NamedTempFile::new().unwrap();
+            tmp.write_all(script.as_bytes()).unwrap();
+            tmp.flush().unwrap();
+            usage::Spec::parse_script(tmp.path()).unwrap()
+        }
+
+        let spec = parse_script_from_str(
+            "#!/usr/bin/env bash\n#USAGE example \"mycli hello\" header=\"Greet\"\necho hi\n",
+        );
+        assert_eq!(spec.examples.len(), 1);
+        assert!(
+            has_any_usage_spec(&spec),
+            "spec with only examples should be recognized as having usage"
+        );
     }
 }

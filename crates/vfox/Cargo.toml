@@ -1,6 +1,6 @@
 [package]
 name = "vfox"
-version = "2026.3.0"
+version = "2026.5.0"
 edition = "2024"
 license = "MIT"
 description = "Interface to vfox plugins"
@@ -40,13 +40,14 @@ mlua = { version = "0.11", features = [
   "send",
 ] }
 once_cell = "1"
-reqwest = { version = "0.12", default-features = false, features = [
+reqwest = { version = "0.13", default-features = false, features = [
   "json",
 ] } # TODO: replace with xx
 serde = "1"
 serde_json = "1"
+toml = "1.0"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "fs", "io-util"] }
+tokio = { version = "1", features = ["macros", "fs", "io-util", "time"] }
 url = "2"
 xx = { version = "2", default-features = false, features = ["archive", "hash"] }
 
@@ -54,7 +55,7 @@ xx = { version = "2", default-features = false, features = ["archive", "hash"] }
 env_logger = { version = "0.11", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 tempfile = "3"
-sigstore-verification = { version = "0.2", default-features = false }
+mise-sigstore = { path = "../mise-sigstore", default-features = false }
 
 [dev-dependencies]
 insta = "1"
@@ -68,19 +69,14 @@ native-tls = [
   "xx/native-tls",
   "xx/http",
   "reqwest/native-tls",
-  "sigstore-verification/native-tls",
+  "mise-sigstore/native-tls",
 ]
-rustls = [
-  "xx/rustls",
-  "xx/http",
-  "reqwest/rustls-tls",
-  "sigstore-verification/rustls",
-]
+rustls = ["xx/rustls", "xx/http", "reqwest/rustls", "mise-sigstore/rustls"]
 rustls-native-roots = [
-  "reqwest/rustls-tls-native-roots",
+  "reqwest/rustls",
   "xx/http",
   "xx/rustls-native-roots",
-  "sigstore-verification/rustls-native-roots",
+  "mise-sigstore/rustls",
 ]
 vendored-lua = ["mlua/vendored"]
 

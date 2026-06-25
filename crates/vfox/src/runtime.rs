@@ -1,7 +1,7 @@
-use crate::config::{arch, env_type, os};
+use crate::config::{arch, os};
 use mlua::{UserData, UserDataFields};
-use once_cell::sync::Lazy;
 use std::path::PathBuf;
+use std::sync::LazyLock as Lazy;
 use std::sync::Mutex;
 
 #[derive(Debug, Clone)]
@@ -17,21 +17,24 @@ static RUNTIME: Lazy<Mutex<Runtime>> = Lazy::new(|| {
     Mutex::new(Runtime {
         os: os(),
         arch: arch(),
-        env_type: env_type(),
+        env_type: None,
         version: "0.6.0".to_string(), // https://github.com/version-fox/vfox/releases
         plugin_dir_path: PathBuf::new(),
     })
 });
 
 impl Runtime {
-    pub(crate) fn get(plugin_dir_path: PathBuf) -> Runtime {
+    pub(crate) fn get(plugin_dir_path: PathBuf, env_type_override: Option<&str>) -> Runtime {
         let mut runtime = RUNTIME.lock().unwrap().clone();
         runtime.plugin_dir_path = plugin_dir_path;
+        if let Some(env_type) = env_type_override {
+            runtime.env_type = Some(env_type.to_string());
+        }
         runtime
     }
 
     pub(crate) fn with_platform(plugin_dir_path: PathBuf, os: &str, arch: &str) -> Runtime {
-        let mut runtime = Self::get(plugin_dir_path);
+        let mut runtime = Self::get(plugin_dir_path, None);
         runtime.os = os.to_string();
         runtime.arch = arch.to_string();
         runtime.env_type = None; // target libc is unknown in cross-platform context
@@ -61,7 +64,7 @@ impl Runtime {
         let mut runtime = RUNTIME.lock().unwrap();
         runtime.os = os();
         runtime.arch = arch();
-        runtime.env_type = env_type();
+        runtime.env_type = None;
     }
 }
 

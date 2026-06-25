@@ -11,7 +11,7 @@ use crate::cli::version;
 use crate::cli::version::VERSION;
 use crate::config::{Config, IGNORED_CONFIG_FILES, Settings};
 use crate::env::PATH_KEY;
-use crate::file::display_path;
+use crate::file::{canonicalize_cached, canonicalize_or_self, display_path};
 use crate::git::Git;
 use crate::plugins::PluginType;
 use crate::plugins::core::CORE_PLUGINS;
@@ -46,6 +46,39 @@ pub struct Doctor {
 #[derive(Debug, clap::Subcommand)]
 pub enum Commands {
     Path(path::Path),
+}
+
+/// outcome of the `[bootstrap.macos.defaults]` doctor check
+enum SystemDefaultsDiagnosis {
+    Unavailable {
+        requested: usize,
+        reason: String,
+    },
+    Checked {
+        requested: usize,
+        out_of_sync: usize,
+    },
+    CheckFailed {
+        requested: usize,
+        error: String,
+    },
+}
+
+/// outcome of the `[bootstrap.user].login_shell` doctor check
+enum SystemLoginShellDiagnosis {
+    Unavailable {
+        reason: String,
+        shell: String,
+    },
+    Checked {
+        shell: String,
+        current: String,
+        out_of_sync: bool,
+    },
+    CheckFailed {
+        shell: String,
+        error: String,
+    },
 }
 
 impl Doctor {
@@ -104,6 +137,16 @@ impl Doctor {
                 .collect(),
         );
         let mut aqua = serde_json::Map::new();
+        let aqua_registry_metadata =
+            crate::aqua::standard_registry::AQUA_STANDARD_REGISTRY_METADATA;
+        aqua.insert(
+            "baked_in_registry_repository".into(),
+            aqua_registry_metadata.repository.into(),
+        );
+        aqua.insert(
+            "baked_in_registry_tag".into(),
+            aqua_registry_metadata.tag.into(),
+        );
         aqua.insert(
             "baked_in_registry_tools".into(),
             aqua_registry_count().into(),
@@ -138,12 +181,23 @@ impl Doctor {
                 .collect(),
         );
         data.insert(
+            "env_files".into(),
+            config
+                .env_results()
+                .await?
+                .env_files
+                .iter()
+                .map(|f| f.to_string_lossy().to_string())
+                .collect(),
+        );
+        data.insert(
             "ignored_config_files".into(),
             IGNORED_CONFIG_FILES
                 .iter()
                 .map(|p| p.to_string_lossy().to_string())
                 .collect(),
         );
+        data.insert("plugins".into(), render_plugins_json());
 
         let tools = ts.list_versions_by_plugin().into_iter().map(|(f, tv)| {
             let versions: serde_json::Value = tv
@@ -169,6 +223,18 @@ impl Doctor {
             (f.ba().to_string(), versions)
         });
         data.insert("toolset".into(), tools.collect());
+
+        if let Some(system_packages) = self.system_packages_json(&config).await {
+            data.insert("system_packages".into(), system_packages);
+        }
+
+        if let Some(system_defaults) = self.system_defaults_json(&config).await {
+            data.insert("system_defaults".into(), system_defaults);
+        }
+
+        if let Some(system_login_shell) = self.system_login_shell_json(&config).await {
+            data.insert("system_login_shell".into(), system_login_shell);
+        }
 
         if !self.errors.is_empty() {
             data.insert("errors".into(), self.errors.clone().into_iter().collect());
@@ -287,6 +353,7 @@ impl Doctor {
     }
     async fn analyze_config(&mut self, config: &Arc<Config>) -> eyre::Result<()> {
         info::section("config_files", render_config_files(config))?;
+        info::section("env_files", render_env_files(config).await?)?;
         if IGNORED_CONFIG_FILES.is_empty() {
             println!();
             info::inline_section("ignored_config_files", "(none)")?;
@@ -318,7 +385,7 @@ impl Doctor {
                 ));
             } else {
                 let cmd = style::nyellow("mise help activate");
-                let url = style::nunderline("https://mise.jdx.dev");
+                let url = style::nunderline("https://mise.en.dev");
                 self.errors.push(formatdoc!(
                     r#"mise is not activated, run {cmd} or
                         read documentation at {url} for activation instructions.
@@ -338,6 +405,310 @@ impl Doctor {
             Err(err) => self.errors.push(format!("failed to load toolset: {err}")),
         }
 
+        self.analyze_system_packages(config).await?;
+        self.analyze_system_defaults(config).await?;
+        self.analyze_system_login_shell(config).await?;
+
+        Ok(())
+    }
+
+    /// same diagnostics as [`Self::analyze_system_packages`] for `doctor -J`
+    async fn system_packages_json(&mut self, config: &Arc<Config>) -> Option<serde_json::Value> {
+        if !Settings::get().experimental {
+            return None;
+        }
+        let mgrs = crate::system::packages_from_config(config);
+        if mgrs.is_empty() {
+            return None;
+        }
+        let mut map = serde_json::Map::new();
+        let mut total_missing = 0;
+        for mp in mgrs {
+            let name = mp.manager.name();
+            if mp.disabled || !mp.manager.is_available() {
+                let reason = if mp.disabled {
+                    "excluded by the system_packages.managers setting".to_string()
+                } else {
+                    mp.manager.unavailable_reason()
+                };
+                map.insert(
+                    name.into(),
+                    serde_json::json!({
+                        "available": false,
+                        "reason": reason,
+                        "requested": mp.requests.len(),
+                    }),
+                );
+                continue;
+            }
+            match mp.manager.installed(&mp.requests).await {
+                Ok(statuses) => {
+                    let missing = statuses
+                        .iter()
+                        .filter(|s| {
+                            !matches!(
+                                s.state,
+                                crate::system::packages::PackageState::Installed { .. }
+                            )
+                        })
+                        .count();
+                    total_missing += missing;
+                    map.insert(
+                        name.into(),
+                        serde_json::json!({
+                            "available": true,
+                            "requested": statuses.len(),
+                            "missing": missing,
+                        }),
+                    );
+                }
+                Err(err) => self
+                    .warnings
+                    .push(format!("failed to check {name} system packages: {err}")),
+            }
+        }
+        if total_missing > 0 {
+            self.warnings.push(format!(
+                "{total_missing} system package(s) are missing, install them with `mise bootstrap packages apply`"
+            ));
+        }
+        Some(map.into())
+    }
+
+    /// Shared `[bootstrap.macos.defaults]` check for the text and JSON doctor paths.
+    /// Pushes the relevant warnings; returns None when nothing is configured.
+    async fn check_system_defaults(
+        &mut self,
+        config: &Arc<Config>,
+    ) -> Option<SystemDefaultsDiagnosis> {
+        if !Settings::get().experimental {
+            return None;
+        }
+        let defaults = crate::system::defaults_from_config(config);
+        if defaults.is_empty() {
+            return None;
+        }
+        let requested = defaults.len();
+        if !crate::system::defaults::is_available() {
+            return Some(SystemDefaultsDiagnosis::Unavailable {
+                requested,
+                reason: crate::system::defaults::unavailable_reason(),
+            });
+        }
+        match crate::system::defaults::status(&defaults).await {
+            Ok(statuses) => {
+                let out_of_sync = statuses
+                    .iter()
+                    .filter(|s| s.state != crate::system::defaults::DefaultsState::Set)
+                    .count();
+                if out_of_sync > 0 {
+                    self.warnings.push(format!(
+                        "{out_of_sync} macOS default(s) are out of sync, apply them with `mise bootstrap macos defaults apply`"
+                    ));
+                }
+                Some(SystemDefaultsDiagnosis::Checked {
+                    requested,
+                    out_of_sync,
+                })
+            }
+            Err(err) => {
+                self.warnings
+                    .push(format!("failed to check macOS defaults: {err}"));
+                Some(SystemDefaultsDiagnosis::CheckFailed {
+                    requested,
+                    error: err.to_string(),
+                })
+            }
+        }
+    }
+
+    /// same diagnostics as [`Self::analyze_system_defaults`] for `doctor -J`
+    async fn system_defaults_json(&mut self, config: &Arc<Config>) -> Option<serde_json::Value> {
+        let json = match self.check_system_defaults(config).await? {
+            SystemDefaultsDiagnosis::Unavailable { requested, reason } => serde_json::json!({
+                "available": false,
+                "reason": reason,
+                "requested": requested,
+            }),
+            SystemDefaultsDiagnosis::Checked {
+                requested,
+                out_of_sync,
+            } => serde_json::json!({
+                "available": true,
+                "requested": requested,
+                "out_of_sync": out_of_sync,
+            }),
+            SystemDefaultsDiagnosis::CheckFailed { requested, error } => serde_json::json!({
+                "available": true,
+                "requested": requested,
+                "error": error,
+            }),
+        };
+        Some(json)
+    }
+
+    async fn analyze_system_defaults(&mut self, config: &Arc<Config>) -> eyre::Result<()> {
+        let Some(diagnosis) = self.check_system_defaults(config).await else {
+            return Ok(());
+        };
+        let line = match diagnosis {
+            SystemDefaultsDiagnosis::Unavailable { requested, reason } => {
+                format!("unavailable ({reason}), {requested} entry(ies) skipped")
+            }
+            SystemDefaultsDiagnosis::Checked {
+                requested,
+                out_of_sync,
+            } => format!("{requested} requested, {out_of_sync} out of sync"),
+            SystemDefaultsDiagnosis::CheckFailed { requested, error } => {
+                format!("{requested} requested, check failed: {error}")
+            }
+        };
+        info::section("system_defaults", line)?;
+        Ok(())
+    }
+
+    /// Shared `[bootstrap.user].login_shell` check for the text and JSON doctor paths.
+    /// Pushes the relevant warnings; returns None when nothing is configured.
+    async fn check_system_login_shell(
+        &mut self,
+        config: &Arc<Config>,
+    ) -> Option<SystemLoginShellDiagnosis> {
+        if !Settings::get().experimental {
+            return None;
+        }
+        let request = crate::system::login_shell_from_config(config)?;
+        if !crate::system::login_shell::is_available() {
+            return Some(SystemLoginShellDiagnosis::Unavailable {
+                reason: crate::system::login_shell::unavailable_reason(),
+                shell: request.shell,
+            });
+        }
+        match crate::system::login_shell::status(&request) {
+            Ok(status) => {
+                let out_of_sync = status.state != crate::system::login_shell::LoginShellState::Set;
+                if out_of_sync {
+                    self.warnings.push(
+                        "login shell is out of sync, apply it with `mise bootstrap user apply`"
+                            .to_string(),
+                    );
+                }
+                Some(SystemLoginShellDiagnosis::Checked {
+                    shell: status.request.shell,
+                    current: status.current,
+                    out_of_sync,
+                })
+            }
+            Err(err) => {
+                self.warnings
+                    .push(format!("failed to check login shell: {err}"));
+                Some(SystemLoginShellDiagnosis::CheckFailed {
+                    shell: request.shell,
+                    error: err.to_string(),
+                })
+            }
+        }
+    }
+
+    /// same diagnostics as [`Self::analyze_system_login_shell`] for `doctor -J`
+    async fn system_login_shell_json(&mut self, config: &Arc<Config>) -> Option<serde_json::Value> {
+        let json = match self.check_system_login_shell(config).await? {
+            SystemLoginShellDiagnosis::Unavailable { reason, shell } => serde_json::json!({
+                "available": false,
+                "reason": reason,
+                "shell": shell,
+            }),
+            SystemLoginShellDiagnosis::Checked {
+                shell,
+                current,
+                out_of_sync,
+            } => serde_json::json!({
+                "available": true,
+                "shell": shell,
+                "current": current,
+                "out_of_sync": out_of_sync,
+            }),
+            SystemLoginShellDiagnosis::CheckFailed { shell, error } => serde_json::json!({
+                "available": true,
+                "shell": shell,
+                "error": error,
+            }),
+        };
+        Some(json)
+    }
+
+    async fn analyze_system_login_shell(&mut self, config: &Arc<Config>) -> eyre::Result<()> {
+        let Some(diagnosis) = self.check_system_login_shell(config).await else {
+            return Ok(());
+        };
+        let line = match diagnosis {
+            SystemLoginShellDiagnosis::Unavailable { reason, shell } => {
+                format!("{shell}: unavailable ({reason}), skipped")
+            }
+            SystemLoginShellDiagnosis::Checked {
+                shell,
+                current,
+                out_of_sync,
+            } => format!("{shell} requested, current {current}, out_of_sync={out_of_sync}"),
+            SystemLoginShellDiagnosis::CheckFailed { shell, error } => {
+                format!("{shell} requested, check failed: {error}")
+            }
+        };
+        info::section("system_login_shell", line)?;
+        Ok(())
+    }
+
+    async fn analyze_system_packages(&mut self, config: &Arc<Config>) -> eyre::Result<()> {
+        if !Settings::get().experimental {
+            return Ok(());
+        }
+        let mgrs = crate::system::packages_from_config(config);
+        if mgrs.is_empty() {
+            return Ok(());
+        }
+        let mut lines = vec![];
+        let mut total_missing = 0;
+        for mp in mgrs {
+            let name = mp.manager.name();
+            if mp.disabled || !mp.manager.is_available() {
+                let reason = if mp.disabled {
+                    "excluded by the system_packages.managers setting".to_string()
+                } else {
+                    mp.manager.unavailable_reason()
+                };
+                lines.push(format!(
+                    "{name}: unavailable ({reason}), {} package(s) skipped",
+                    mp.requests.len()
+                ));
+                continue;
+            }
+            match mp.manager.installed(&mp.requests).await {
+                Ok(statuses) => {
+                    let missing = statuses
+                        .iter()
+                        .filter(|s| {
+                            !matches!(
+                                s.state,
+                                crate::system::packages::PackageState::Installed { .. }
+                            )
+                        })
+                        .count();
+                    lines.push(format!(
+                        "{name}: {} requested, {missing} missing",
+                        statuses.len()
+                    ));
+                    total_missing += missing;
+                }
+                Err(err) => self
+                    .warnings
+                    .push(format!("failed to check {name} system packages: {err}")),
+            }
+        }
+        if total_missing > 0 {
+            self.warnings.push(format!(
+                "{total_missing} system package(s) are missing, install them with `mise bootstrap packages apply`"
+            ));
+        }
+        info::section("system_packages", lines.join("\n"))?;
         Ok(())
     }
 
@@ -374,7 +745,7 @@ impl Doctor {
     }
 
     async fn analyze_shims(&mut self, config: &Arc<Config>, toolset: &Toolset) {
-        let mise_bin = file::which("mise").unwrap_or(env::MISE_BIN.clone());
+        let mise_bin = file::which_no_shims("mise").unwrap_or(env::MISE_BIN.clone());
 
         if let Ok((missing, extra)) = shims::get_shim_diffs(config, mise_bin, toolset).await {
             let cmd = style::nyellow("mise reshim");
@@ -503,13 +874,13 @@ impl Doctor {
             return;
         }
 
-        let resolve = |p: &PathBuf| p.canonicalize().unwrap_or_else(|_| p.clone());
+        let resolve = |p: &PathBuf| canonicalize_or_self(p);
 
         // Resolve all mise-managed paths for comparison
         let mise_paths_resolved: HashSet<PathBuf> = mise_paths.iter().map(resolve).collect();
 
         // Also exclude the mise binary's own directory
-        let mise_bin_parent = env::MISE_BIN.parent().and_then(|p| p.canonicalize().ok());
+        let mise_bin_parent = env::MISE_BIN.parent().and_then(canonicalize_cached);
 
         // Find the index of the first mise-managed path in the current PATH
         // Note: mise_bin_parent is intentionally excluded here — it's a directory like
@@ -551,7 +922,10 @@ impl Doctor {
 }
 
 fn shims_on_path() -> bool {
-    env::PATH.contains(&dirs::SHIMS.to_path_buf())
+    let shims = &*dirs::SHIMS;
+    env::PATH
+        .iter()
+        .any(|p| crate::file::paths_eq(&crate::file::replace_path(p), shims))
 }
 
 fn yn(b: bool) -> String {
@@ -604,52 +978,105 @@ fn render_config_files(config: &Config) -> String {
         .join("\n")
 }
 
-fn render_backends() -> String {
-    let mut s = vec![];
-    for b in BackendType::iter().filter(|b| b != &BackendType::Unknown) {
-        s.push(format!("{b}"));
+async fn render_env_files(config: &Arc<Config>) -> eyre::Result<String> {
+    let env_files = &config.env_results().await?.env_files;
+    if env_files.is_empty() {
+        Ok("(none)".to_string())
+    } else {
+        Ok(env_files.iter().map(display_path).join("\n"))
     }
-    s.join("\n")
+}
+
+fn render_backends() -> String {
+    BackendType::iter()
+        .filter(|b| b != &BackendType::Unknown)
+        .map(|b| b.to_string())
+        .join("\n")
 }
 
 fn render_plugins() -> String {
-    let plugins = backend::list()
-        .into_iter()
-        .filter(|b| {
-            b.plugin()
-                .is_some_and(|p| p.is_installed() && b.get_type() == BackendType::Asdf)
-        })
-        .collect::<Vec<_>>();
+    let plugins = installed_plugins();
     let max_plugin_name_len = plugins
         .iter()
-        .map(|p| p.id().len())
+        .map(|p| p.name().len())
         .max()
         .unwrap_or(0)
         .min(40);
     plugins
         .into_iter()
-        .filter(|b| b.plugin().is_some())
         .map(|p| {
-            let p = p.plugin().unwrap();
             let padded_name = pad_str(p.name(), max_plugin_name_len, Alignment::Left, None);
-            let extra = match p {
-                PluginEnum::Asdf(_) | PluginEnum::Vfox(_) | PluginEnum::VfoxBackend(_) => {
-                    let git = Git::new(dirs::PLUGINS.join(p.name()));
-                    match git.get_remote_url() {
-                        Some(url) => {
-                            let sha = git
-                                .current_sha_short()
-                                .unwrap_or_else(|_| "(unknown)".to_string());
-                            format!("{url}#{sha}")
-                        }
-                        None => "".to_string(),
-                    }
-                } // TODO: PluginType::Core => "(core)".to_string(),
-            };
+            let extra = plugin_extra(&p);
             format!("{padded_name}  {}", style::ndim(extra))
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn render_plugins_json() -> serde_json::Value {
+    installed_plugins()
+        .into_iter()
+        .map(|plugin| {
+            let mut value = serde_json::Map::new();
+            value.insert(
+                "type".into(),
+                serde_json::Value::String(plugin_type_name(plugin.get_plugin_type()).to_string()),
+            );
+            if let Some(git) = plugin_git(&plugin)
+                && let Some(url) = git.get_remote_url()
+            {
+                value.insert("url".into(), serde_json::Value::String(url));
+                if let Ok(ref_) = git.current_abbrev_ref() {
+                    value.insert("ref".into(), serde_json::Value::String(ref_));
+                }
+                if let Ok(sha) = git.current_sha_short() {
+                    value.insert("sha".into(), serde_json::Value::String(sha));
+                }
+            }
+            (plugin.name().to_string(), serde_json::Value::Object(value))
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into()
+}
+
+fn installed_plugins() -> Vec<PluginEnum> {
+    install_state::list_plugins()
+        .iter()
+        .map(|(name, plugin_type)| plugin_type.plugin(name.clone()))
+        .filter(|plugin| plugin.is_installed())
+        .collect()
+}
+
+fn plugin_extra(plugin: &PluginEnum) -> String {
+    let Some(git) = plugin_git(plugin) else {
+        return "".to_string();
+    };
+    match git.get_remote_url() {
+        Some(url) => {
+            let sha = git
+                .current_sha_short()
+                .unwrap_or_else(|_| "(unknown)".to_string());
+            format!("{url}#{sha}")
+        }
+        None => "".to_string(),
+    }
+}
+
+fn plugin_git(plugin: &PluginEnum) -> Option<Git> {
+    let path = dirs::PLUGINS.join(plugin.name());
+    if path.join(".git").exists() {
+        Some(Git::new(path))
+    } else {
+        None
+    }
+}
+
+fn plugin_type_name(plugin_type: PluginType) -> &'static str {
+    match plugin_type {
+        PluginType::Asdf => "asdf",
+        PluginType::Vfox => "vfox",
+        PluginType::VfoxBackend => "vfox_backend",
+    }
 }
 
 fn build_info() -> IndexMap<String, &'static str> {
@@ -680,11 +1107,17 @@ fn shell() -> String {
 }
 
 fn aqua_registry_count() -> usize {
-    aqua_registry::AQUA_STANDARD_REGISTRY_FILES.len()
+    crate::aqua::standard_registry::AQUA_STANDARD_REGISTRY_FILES.len()
 }
 
 fn aqua_registry_count_str() -> String {
-    format!("baked in registry tools: {}", aqua_registry_count())
+    let metadata = crate::aqua::standard_registry::AQUA_STANDARD_REGISTRY_METADATA;
+    format!(
+        "baked in registry: {}@{}\nbaked in registry tools: {}",
+        metadata.repository,
+        metadata.tag,
+        aqua_registry_count()
+    )
 }
 
 static AFTER_LONG_HELP: &str = color_print::cstr!(

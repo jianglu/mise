@@ -3,11 +3,13 @@ use crate::backend::VersionInfo;
 use crate::backend::backend_type::BackendType;
 use crate::cli::args::BackendArg;
 use crate::cmd::CmdLineRunner;
+#[cfg(unix)]
+use crate::env;
 use crate::file;
 use crate::http::HTTP_FETCH;
 use crate::install_context::InstallContext;
 use crate::toolset::ToolVersion;
-use crate::{Result, config::Config, env};
+use crate::{Result, config::Config};
 use async_trait::async_trait;
 use indoc::formatdoc;
 use serde::Deserialize;
@@ -39,6 +41,17 @@ impl Backend for GemBackend {
         Ok(vec!["ruby"])
     }
 
+    fn mark_prereleases_from_version_pattern(&self) -> bool {
+        true
+    }
+
+    /// Gem installs via `gem install`, delegating fetch/resolve to RubyGems rather
+    /// than downloading an artifact mise verifies, so a lockfile URL can't be
+    /// enforced even though rubygems.org exposes one. Opt out of `--locked`.
+    fn supports_lockfile_url(&self) -> bool {
+        false
+    }
+
     async fn _list_remote_versions(&self, config: &Arc<Config>) -> eyre::Result<Vec<VersionInfo>> {
         // Get the gem source URL using the mise-managed Ruby environment
         let source_url = self.get_gem_source(config).await;
@@ -66,6 +79,7 @@ impl Backend for GemBackend {
         self.warn_if_dependency_missing(
             &ctx.config,
             "gem",
+            &["ruby", "gem"],
             "To use gem packages with mise, you need to install Ruby first:\n\
               mise use ruby@latest",
         )
@@ -80,6 +94,7 @@ impl Backend for GemBackend {
             .arg(tv.install_path().join("libexec"))
             .with_pr(ctx.pr.as_ref())
             .envs(self.dependency_env(&ctx.config).await?)
+            .envs(tv.install_env())
             .execute()?;
 
         // We install the gem to {install_path}/libexec and create a wrapper script for each executable

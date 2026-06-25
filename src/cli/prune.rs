@@ -18,8 +18,8 @@ use super::trust::Trust;
 ///
 /// mise tracks which config files have been used in ~/.local/state/mise/tracked-configs
 /// Versions which are no longer the latest specified in any of those configs are deleted.
-/// Versions installed only with environment variables `MISE_<PLUGIN>_VERSION` will be deleted,
-/// as will versions only referenced on the command line `mise exec <PLUGIN>@<VERSION>`.
+/// Versions installed only with environment variables `MISE_<TOOL>_VERSION` will be deleted,
+/// as will versions only referenced on the command line `mise exec <TOOL>@<VERSION>`.
 ///
 /// You can list prunable tools with `mise ls --prunable`
 #[derive(Debug, clap::Args)]
@@ -33,7 +33,7 @@ pub struct Prune {
     #[clap(long, short = 'n')]
     pub dry_run: bool,
 
-    /// Prune only tracked and trusted configuration links that point to non-existent configurations
+    /// Prune only tracked and trusted configuration links that point to nonexistent configurations
     #[clap(long)]
     pub configs: bool,
 
@@ -75,7 +75,13 @@ impl Prune {
             }
             config = Config::reset().await?;
             let ts = config.get_toolset().await?;
-            config::rebuild_shims_and_runtime_symlinks(&config, ts, &[]).await?;
+            config::rebuild_shims_and_runtime_symlinks(
+                &config,
+                ts,
+                &[],
+                crate::lockfile::LockfileUpdateMode::Normal,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -109,7 +115,7 @@ pub async fn prunable_tools(
     }
 
     // Remove versions that are still needed by tracked configs
-    let needed_versions = get_versions_needed_by_tracked_configs(config).await?;
+    let needed_versions = get_versions_needed_by_tracked_configs(config, true, true).await?;
     for key in needed_versions {
         to_delete.remove(&key);
     }
@@ -133,14 +139,17 @@ async fn delete(
         if dry_run {
             prefix = format!("{} {} ", prefix, style("[dryrun]").bold());
         }
-        let pr = mpr.add(&prefix);
-        if dry_run || Settings::get().yes || prompt::confirm_with_all(format!("remove {} ?", &tv))?
+        if !dry_run
+            && !Settings::get().yes
+            && !prompt::confirm_with_all(format!("remove {} ?", &tv))?
         {
-            p.uninstall_version(config, &tv, pr.as_ref(), dry_run)
-                .await?;
-            runtime_symlinks::remove_missing_symlinks(p)?;
-            pr.finish();
+            continue;
         }
+        let pr = mpr.add(&prefix);
+        p.uninstall_version(config, &tv, pr.as_ref(), dry_run)
+            .await?;
+        runtime_symlinks::remove_missing_symlinks(p)?;
+        pr.finish();
     }
     Ok(())
 }

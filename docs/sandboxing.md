@@ -1,10 +1,6 @@
-# Sandboxing <Badge type="warning" text="experimental" />
+# Sandboxing
 
 Mise supports lightweight process sandboxing for `mise exec` and `mise run`, inspired by [zerobox](https://github.com/afshinm/zerobox). Sandboxing restricts filesystem, network, and environment variable access with granular controls. No Docker required, minimal overhead.
-
-::: warning
-Sandboxing is an experimental feature. Enable it with `mise settings experimental=true`.
-:::
 
 ## Quick Start
 
@@ -26,17 +22,17 @@ mise x --deny-all --allow-read=. --allow-write=./dist --allow-net=registry.npmjs
 
 ## CLI Flags
 
-| Flag                   | Description                                                                                   |
-| ---------------------- | --------------------------------------------------------------------------------------------- |
-| `--deny-all`           | Block reads, writes, network, and env vars                                                    |
-| `--deny-read`          | Block filesystem reads (system libs and tool dirs still accessible)                           |
-| `--deny-write`         | Block all filesystem writes (except `/tmp`)                                                   |
-| `--deny-net`           | Block all network access                                                                      |
-| `--deny-env`           | Block env var inheritance (only `PATH`, `HOME`, `USER`, `SHELL`, `TERM`, `LANG` pass through) |
-| `--allow-read=<path>`  | Allow reads from specific path (implies `--deny-read` for everything else)                    |
-| `--allow-write=<path>` | Allow writes to specific path (implies `--deny-write` for everything else)                    |
-| `--allow-net=<host>`   | Allow network to specific host (implies `--deny-net` for everything else)                     |
-| `--allow-env=<var>`    | Allow specific env var through (implies `--deny-env` for everything else)                     |
+| Flag                   | Description                                                                                                            |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `--deny-all`           | Block reads, writes, network, and env vars                                                                             |
+| `--deny-read`          | Block filesystem reads (system libs and tool dirs still accessible)                                                    |
+| `--deny-write`         | Block all filesystem writes (except `/tmp`)                                                                            |
+| `--deny-net`           | Block all network access                                                                                               |
+| `--deny-env`           | Block env var inheritance (only `PATH`, `HOME`, `USER`, `SHELL`, `TERM`, `LANG` pass through)                          |
+| `--allow-read=<path>`  | Allow reads from specific path (implies `--deny-read` for everything else)                                             |
+| `--allow-write=<path>` | Allow writes to specific path (implies `--deny-write` for everything else)                                             |
+| `--allow-net=<host>`   | Allow network to specific host (implies `--deny-net` for everything else)                                              |
+| `--allow-env=<var>`    | Allow specific env var through (implies `--deny-env` for everything else). Supports wildcards: `--allow-env='MYAPP_*'` |
 
 These flags work with both `mise exec` (`mise x`) and `mise run`.
 
@@ -108,7 +104,7 @@ When filesystem restrictions are active, certain paths remain accessible so tool
 
 Filesystem sandboxing uses [Landlock](https://landlock.io/) (available since Linux 5.13). Network sandboxing uses [seccomp-bpf](https://www.kernel.org/doc/html/latest/userspace-api/seccomp_filter.html) to block inet socket creation while allowing Unix sockets.
 
-If Landlock is unavailable (older kernels), a warning is printed and the command runs unsandboxed.
+If Landlock is unavailable or cannot apply filesystem restrictions, the command fails.
 
 **Limitation**: Per-host network filtering (`--allow-net=<host>`) is not supported on Linux in v1. On Linux, `--allow-net` falls back to allowing all network access. This works on macOS via Seatbelt.
 
@@ -140,6 +136,16 @@ mise x --deny-net -- make build
 mise x --deny-all --allow-read=./src --allow-write=./dist node@20 -- node build.js
 ```
 
+### Restrict env vars to a namespace
+
+```bash
+# Only pass through env vars starting with MYAPP_
+mise x --allow-env='MYAPP_*' -- node app.js
+
+# Allow multiple patterns
+mise x --allow-env='MYAPP_*' --allow-env='NODE_*' -- node app.js
+```
+
 ### Sandboxed task definition
 
 ```toml
@@ -148,4 +154,5 @@ run = "npm test"
 deny_net = true
 deny_write = true
 allow_write = ["./coverage", "./node_modules/.cache"]
+allow_env = ["NODE_*", "npm_*"]
 ```

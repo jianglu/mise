@@ -21,6 +21,12 @@ This page lists various ways to install `mise` on your system.
 Package managers (apt, dnf, brew, pacman, etc.) update mise when you update system packages. Other methods can be updated with `mise self-update`.
 :::
 
+::: tip Keep mise up to date
+mise connects to many external registries and backends, such as aqua, GitHub releases, language package registries, and system package managers. Those services change over time, so mise works best when the CLI is kept on a recent version.
+
+Projects and organizations should generally set a [`min_version`](/configuration.html#minimum-mise-version) when they need a newer mise feature instead of locking every user to a specific mise executable. While there are ways to pin or bootstrap a particular mise version, locking users to one mise version is generally discouraged. Pinning mise back is like preventing `apt update` or `brew update` from refreshing package metadata: it can hide deprecation messages and cause bit rot with upstream integrations like aqua-registry. Breaking changes are avoided unless they go through a long deprecation process, so staying current should usually be low risk.
+:::
+
 ### <https://mise.run>
 
 Note that it isn't necessary for `mise` to be on `PATH`. If you run the activate script in your
@@ -78,7 +84,7 @@ If you want to verify the install script hasn't been tampered with:
 
 ```sh
 gpg --keyserver hkps://keys.openpgp.org --recv-keys 24853EC9F655CE80B48E6C3A8B81C9D17413A06D
-curl https://mise.jdx.dev/install.sh.sig | gpg --decrypt > install.sh
+curl https://mise.en.dev/install.sh.sig | gpg --decrypt > install.sh
 # ensure the above is signed with the mise release key
 sh ./install.sh
 ```
@@ -121,18 +127,16 @@ On Ubuntu 26.04+, mise is available via a PPA:
 
 ```sh
 sudo add-apt-repository -y ppa:jdxcode/mise
-sudo apt update -y
+sudo apt update
 sudo apt install -y mise
 ```
 
-For older Ubuntu/Debian versions:
+On Debian 11+ and Ubuntu 22.04+, mise repository can be enabled with extrepo:
 
 ```sh
-sudo apt update -y && sudo apt install -y curl
-sudo install -dm 755 /etc/apt/keyrings
-curl -fSs https://mise.jdx.dev/gpg-key.pub | sudo tee /etc/apt/keyrings/mise-archive-keyring.asc 1> /dev/null
-echo "deb [signed-by=/etc/apt/keyrings/mise-archive-keyring.asc] https://mise.jdx.dev/deb stable main" | sudo tee /etc/apt/sources.list.d/mise.list
-sudo apt update -y
+sudo apt install -y extrepo
+sudo extrepo enable mise
+sudo apt update
 sudo apt install -y mise
 ```
 
@@ -169,19 +173,30 @@ cargo install mise --git https://github.com/jdx/mise --branch main
 
 ### dnf
 
-#### Fedora 41+, RHEL 9+, CentOS Stream 9+
+#### Fedora 41+, CentOS Stream 9+, RHEL 10+
 
 ```sh
 dnf copr enable jdxcode/mise
 dnf install mise
 ```
 
-[COPR package page](https://copr.fedorainfracloud.org/coprs/jdxcode/mise/)
+#### RHEL 9 / AlmaLinux 9 / Rocky 9
 
-### Snap (Linux, currently in beta)
+RHEL 9 AppStream is currently frozen at Rust 1.88, which is older than mise's
+minimum supported Rust version. Use the CentOS Stream 9 build instead â€” the
+resulting binary works on RHEL 9 derivatives:
 
 ```sh
-sudo snap install mise --classic --beta
+dnf copr enable jdxcode/mise centos-stream+epel-next-9
+dnf install mise
+```
+
+[COPR package page](https://copr.fedorainfracloud.org/coprs/jdxcode/mise/)
+
+### Snap (Linux)
+
+```sh
+sudo snap install mise --classic
 ```
 
 [snapcraft.io page](https://snapcraft.io/mise)
@@ -225,16 +240,18 @@ mise is available on npm as a precompiled binary. This isn't a Node.js packageâ€
 via npm. This is useful for JS projects that want to setup mise via `package.json` or `npx`.
 
 ```sh
-npm install -g @jdxcode/mise
+npm install -g mise
 ```
 
 Use npx if you just want to test it out for a single command without fully installing:
 
 ```sh
-npx @jdxcode/mise exec python@3.11 -- python some_script.py
+npx mise exec python@3.11 -- python some_script.py
 ```
 
-[npm package](https://www.npmjs.com/package/@jdxcode/mise)
+[npm package](https://www.npmjs.com/package/mise)
+
+The legacy [`@jdxcode/mise`](https://www.npmjs.com/package/@jdxcode/mise) package is still published.
 
 ### GitHub Releases
 
@@ -273,14 +290,14 @@ For precompiled binaries, enable [nix-ld](https://github.com/Mic92/nix-ld) and d
 
 ```sh
 yum install -y yum-utils
-yum-config-manager --add-repo https://mise.jdx.dev/rpm/mise.repo
+yum-config-manager --add-repo https://mise.en.dev/rpm/mise.repo
 yum install -y mise
 ```
 
 ### zypper
 
 ```sh
-sudo wget https://mise.jdx.dev/rpm/mise.repo -O /etc/zypp/repos.d/mise.repo
+sudo wget https://mise.en.dev/rpm/mise.repo -O /etc/zypp/repos.d/mise.repo
 sudo zypper refresh
 sudo zypper install mise
 ```

@@ -3,8 +3,9 @@ use crate::cache::{PruneOptions, PruneResults};
 use crate::config::Settings;
 use crate::dirs::CACHE;
 use crate::toolset::env_cache::CachedEnv;
+use bytesize::ByteSize;
 use eyre::Result;
-use number_prefix::NumberPrefix;
+use heck::ToKebabCase;
 use std::time::Duration;
 
 /// Removes stale mise cache files
@@ -14,9 +15,9 @@ use std::time::Duration;
 #[derive(Debug, clap::Args)]
 #[clap(verbatim_doc_comment, visible_alias = "p")]
 pub struct CachePrune {
-    /// Plugin(s) to clear cache for
+    /// Tool(s) to prune cache for
     /// e.g.: node, python
-    plugin: Option<Vec<String>>,
+    tool: Option<Vec<String>>,
 
     /// Show pruned files
     #[clap(long, short, action = clap::ArgAction::Count)]
@@ -39,14 +40,33 @@ impl CachePrune {
         };
         let mut results = PruneResults { size: 0, count: 0 };
 
-        // Prune main cache
-        let r = cache::prune(&CACHE.to_path_buf(), &opts)?;
-        results.size += r.size;
-        results.count += r.count;
+        let cache_dirs = match &self.tool {
+            Some(tools) => tools
+                .iter()
+                .filter_map(|tool| {
+                    let kebab = tool.to_kebab_case();
+                    if kebab.is_empty() {
+                        warn!("invalid tool name: {tool}");
+                        None
+                    } else {
+                        Some(CACHE.join(kebab))
+                    }
+                })
+                .collect(),
+            None => vec![CACHE.to_path_buf()],
+        };
+
+        for p in cache_dirs {
+            if p.exists() {
+                let r = cache::prune(&p, &opts)?;
+                results.size += r.size;
+                results.count += r.count;
+            }
+        }
 
         // Prune env cache using env_cache_ttl
         let env_cache_dir = CachedEnv::cache_dir();
-        if env_cache_dir.exists() {
+        if self.tool.is_none() && env_cache_dir.exists() {
             let env_opts = PruneOptions {
                 dry_run: self.dry_run,
                 verbose: self.verbose > 0,
@@ -59,14 +79,17 @@ impl CachePrune {
 
         let count = results.count;
         let size = bytes_str(results.size);
-        info!("cache pruned {count} files, {size}");
+        match &self.tool {
+            Some(tools) => info!(
+                "cache pruned for {}: {count} files, {size}",
+                tools.join(", ")
+            ),
+            None => info!("cache pruned {count} files, {size}"),
+        }
         Ok(())
     }
 }
 
 fn bytes_str(bytes: u64) -> String {
-    match NumberPrefix::binary(bytes as f64) {
-        NumberPrefix::Standalone(bytes) => format!("{bytes} bytes"),
-        NumberPrefix::Prefixed(prefix, n) => format!("{n:.1} {prefix}B"),
-    }
+    ByteSize::b(bytes).display().iec().to_string()
 }

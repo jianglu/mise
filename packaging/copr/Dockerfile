@@ -1,4 +1,4 @@
-FROM fedora:43@sha256:781b7642e8bf256e9cf75d2aa58d86f5cc695fd2df113517614e181a5eee9138
+FROM fedora:45@sha256:0c1f63ed8fb818fad16cf6ae091598c410a21d2e1a9adf183beb93189299bfba
 LABEL maintainer="jdx"
 
 # Install packaging dependencies
@@ -11,19 +11,16 @@ RUN dnf update -y && \
         rust \
         cargo \
         gcc \
+        openssl-devel \
         tar \
         gzip && \
     dnf clean all
 
-# Install copr-cli
-RUN pip3 install copr-cli
-
-# Add mise to PATH
-ENV PATH="/root/.local/bin:${PATH}"
-
-# Install mise and use it to install cargo-vendor
-RUN curl https://mise.run | sh
-RUN mise use -g cargo-binstall cargo:cargo-vendor
+# Install copr-cli via dnf to ensure dependencies are properly managed and to avoid potential issues with manual installation
+RUN dnf install -y copr-cli && \
+    dnf clean all && \
+    test "$(readlink -f "$(command -v copr-cli)")" = "/usr/bin/copr-cli" && \
+    copr-cli --help >/dev/null
 
 # Set up RPM build environment
 RUN rpmdev-setuptree

@@ -6,13 +6,18 @@
 
 Marks a config file as trusted
 
-This means mise will parse the file with potentially dangerous
-features enabled.
+This means mise is allowed to parse the file when it needs to read config
+that may execute code or affect the environment. mise checks trust before
+parsing `mise.toml`. Without trust, mise may prompt, skip the config in some
+discovery paths, fail with an untrusted-config error when it cannot prompt,
+or assume trust in detected CI unless paranoid mode is enabled.
 
-This includes:
-- environment variables
-- templates
-- `path:` plugin versions
+Safe config files do not require trust: files that only contain
+`min_version`, `[tools]` entries with plain version strings (or arrays
+of them), and `[tasks]` (no templates and no tool options) are loaded
+without prompting, since nothing in them executes code at load time —
+tools install and tasks run only on explicit commands like `mise install`
+or `mise run`.
 
 ## Arguments
 

@@ -147,6 +147,10 @@ mise settings locked=true
 MISE_LOCKED=1 mise install
 ```
 
+::: warning
+All mise settings are global in scope. Setting `locked = true` in a project's `mise.toml` applies to **all** tool resolution, including tools from your global `~/.config/mise/config.toml`. If you see warnings about global tools missing from the lockfile, run `mise lock -g` to generate a global lockfile.
+:::
+
 When enabled, `mise install` will fail if a tool doesn't have a URL for the current platform in the lockfile. To fix this, first populate the lockfile with URLs:
 
 ```sh
@@ -184,10 +188,46 @@ When you want to update tool versions:
 
 ```sh
 # Update tool version in mise.toml
-mise use node@24
+mise use node@26
 
 # This will update both the installation and mise.lock
 ```
+
+### Pinning a Locked Version
+
+You can pin a specific version in the lockfile while keeping a fuzzy specifier in `mise.toml`:
+
+```sh
+# mise.toml has node = "latest" or node = "22"
+mise upgrade node@22.15.0   # installs 22.15.0 and updates mise.lock
+mise lock node@22.15.0      # updates mise.lock without reinstalling
+```
+
+If the version doesn't match the current config prefix, the config is updated automatically. For example, if `mise.toml` has `node = "20"` and you run `mise upgrade node@22.15.0`, the config is bumped to `node = "22"` (preserving the same precision level) and the lockfile is set to `22.15.0`.
+
+## Command Behavior with Lockfiles
+
+The table below shows how each command interacts with `mise.toml` and `mise.lock`:
+
+| Command                     | Installs | Updates `mise.toml`                  | Updates `mise.lock`                     |
+| --------------------------- | -------- | ------------------------------------ | --------------------------------------- |
+| `mise use node@22`          | Yes      | Yes (sets `node = "22"`)             | Yes                                     |
+| `mise install`              | Yes      | No                                   | Yes                                     |
+| `mise install node`         | Yes      | No                                   | Yes (installs config version for node)  |
+| `mise install node@22.15.0` | Yes      | No                                   | No (one-off install, not config-driven) |
+| `mise upgrade`              | Yes      | No                                   | Yes                                     |
+| `mise upgrade node`         | Yes      | No                                   | Yes (upgrades node within its range)    |
+| `mise upgrade node@22.15.0` | Yes      | Only if version doesn't match prefix | Yes                                     |
+| `mise upgrade --bump`       | Yes      | Yes (bumps prefix to match)          | Yes                                     |
+| `mise lock`                 | No       | No                                   | Yes (regenerates for all tools)         |
+| `mise lock node@22.15.0`    | No       | Only if version doesn't match prefix | Yes                                     |
+
+**Key points:**
+
+- **`mise use`** is for changing which version you want in your config — it always writes to `mise.toml`
+- **`mise install`** installs what's in your config without changing it — `mise install node` installs the config's version of node and updates the lockfile, while `mise install node@22.15.0` is a one-off that doesn't
+- **`mise upgrade`** upgrades tools within their configured ranges and updates the lockfile — passing `tool@version` lets you target a specific version
+- **`mise lock`** regenerates lockfile entries without installing — passing `tool@version` lets you pin a specific version
 
 ## Backend Support
 
@@ -244,6 +284,20 @@ mise uninstall --all
 mise install
 ```
 
+### Ruby Precompiled Build Revision Releases
+
+Precompiled Ruby binaries can have build revision releases for the same Ruby
+version. The lockfile keeps `version = "3.3.11"` but pins the selected build
+revision in the platform `url`:
+
+```toml
+url = "https://github.com/jdx/ruby/releases/download/3.3.11-1/ruby-3.3.11.x86_64_linux.tar.gz"
+```
+
+Here `3.3.11-1` is build revision `1`. See [Ruby precompiled build revisions](/lang/ruby.html#precompiled-build-revisions)
+for details on why revisions exist, how unlocked installs behave, and how to
+update older lockfiles.
+
 ### Lockfile Conflicts
 
 When merging branches with different lockfiles:
@@ -281,16 +335,55 @@ mise install
 mise use node@$(jq -r '.engines.node' package.json)
 ```
 
-## Minimum Release Age
+## Provenance and Security
 
-In addition to lockfiles, mise supports the [`install_before`](/configuration/settings.html#install_before) setting to limit supply chain risk by only installing versions that have been available for a minimum amount of time:
+When `mise lock` generates a lockfile, it records a verified provenance type (e.g., `slsa`, `cosign`, `minisign`, `github-attestations`) for each tool when one is available. For the **current platform**, mise downloads the artifact and performs full cryptographic verification at lock time -- ensuring the provenance entry in the lockfile is backed by actual verification, not just registry metadata. This applies to both the aqua and github backends. For cross-platform entries, provenance is detected from registry metadata without verification (since the artifact may not be runnable on the current machine).
+
+By default, when `mise install` sees a lockfile with both a checksum and a verified provenance entry, it trusts the lockfile and skips re-verification. This avoids redundant API calls (e.g., GitHub attestation queries) which can cause rate limit issues in CI. Since the current platform's provenance was already verified during `mise lock`, this is safe.
+
+If GitHub Artifact Attestations are enabled but the GitHub API confirms none exist for a checksum-backed artifact, mise may record `github_attestations = "unavailable"`. This is a negative cache entry, not provenance: it only skips the redundant GitHub attestation probe on later installs from that lockfile. Other verification paths such as SLSA, Cosign, Minisign, and checksum verification still run as usual.
+
+GitHub's docs show binary attestations generated from an existing artifact path with [`actions/attest`](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations#generating-build-provenance-for-binaries), and the REST API lists attestations by [subject digest](https://docs.github.com/en/rest/orgs/attestations#list-attestations). That means an attestation can appear after the release asset was uploaded. A later `mise lock` run or `MISE_LOCKED_VERIFY_PROVENANCE=1 mise install` can discover attestations added after the lockfile recorded them as unavailable.
+
+For additional security, you can force provenance re-verification at install time on every install:
 
 ```toml
 [settings]
-install_before = "7d"  # only resolve to versions released more than 7 days ago
+locked_verify_provenance = true
 ```
 
-This pairs well with lockfiles — use `install_before` to avoid picking up brand-new releases, and lockfiles to pin the exact versions you've vetted.
+Or via environment variable:
+
+```sh
+MISE_LOCKED_VERIFY_PROVENANCE=1 mise install
+```
+
+This is also automatically enabled in [paranoid mode](/paranoid.html):
+
+```toml
+[settings]
+paranoid = true
+```
+
+When enabled, every `mise install` will cryptographically verify provenance regardless of what the lockfile contains, ensuring the artifact was built by a trusted CI pipeline.
+
+## Minimum Release Age
+
+In addition to lockfiles, mise uses the [`minimum_release_age`](/configuration/settings.html#minimum_release_age) setting to limit supply chain risk by only installing versions that have been available for a minimum amount of time. It defaults to `24h`:
+
+```toml
+[settings]
+minimum_release_age = "7d"  # override the default 24h delay
+```
+
+This pairs well with lockfiles — use `minimum_release_age` to avoid picking up brand-new releases, and lockfiles to pin the exact versions you've vetted.
+
+This setting filters top-level fuzzy version resolution for backends that provide release timestamps.
+Versions without timestamps are included by default.
+
+Only `npm:` and `pipx:` currently forward the same cutoff into transitive dependency resolution during
+install. Other backends may select an older top-level tool version, but they do not constrain
+dependencies fetched by the tool's installer/compiler.
 
 ## See Also
 

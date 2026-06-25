@@ -27,6 +27,7 @@ pub enum BackendType {
     Go,
     Npm,
     Pipx,
+    Pkgx,
     Spm,
     Http,
     S3,
@@ -46,6 +47,14 @@ impl Display for BackendType {
 }
 
 impl BackendType {
+    pub fn disable_key(&self) -> Option<&str> {
+        match self {
+            BackendType::Unknown => None,
+            BackendType::VfoxBackend(plugin_name) => Some(plugin_name),
+            _ => Some(self.as_ref()),
+        }
+    }
+
     pub fn guess(s: &str) -> BackendType {
         let prefix = s.split(':').next().unwrap_or(s);
 
@@ -63,6 +72,7 @@ impl BackendType {
             "go" => BackendType::Go,
             "npm" => BackendType::Npm,
             "pipx" => BackendType::Pipx,
+            "pkgx" => BackendType::Pkgx,
             "spm" => BackendType::Spm,
             "http" => BackendType::Http,
             "s3" => BackendType::S3,
@@ -72,12 +82,12 @@ impl BackendType {
         }
     }
 
-    /// Returns true if this backend requires experimental mode to be enabled
+    /// Returns true if this backend is still gated behind experimental mode.
     pub fn is_experimental(&self) -> bool {
-        use super::{conda, dotnet, s3, spm};
+        use super::{dotnet, pkgx, s3, spm};
         match self {
-            BackendType::Conda => conda::EXPERIMENTAL,
             BackendType::Dotnet => dotnet::EXPERIMENTAL,
+            BackendType::Pkgx => pkgx::EXPERIMENTAL,
             BackendType::S3 => s3::EXPERIMENTAL,
             BackendType::Spm => spm::EXPERIMENTAL,
             _ => false,

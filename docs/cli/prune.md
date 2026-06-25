@@ -8,8 +8,8 @@ Delete unused versions of tools
 
 mise tracks which config files have been used in ~/.local/state/mise/tracked-configs
 Versions which are no longer the latest specified in any of those configs are deleted.
-Versions installed only with environment variables `MISE_<PLUGIN>_VERSION` will be deleted,
-as will versions only referenced on the command line `mise exec <PLUGIN>@<VERSION>`.
+Versions installed only with environment variables `MISE_<TOOL>_VERSION` will be deleted,
+as will versions only referenced on the command line `mise exec <TOOL>@<VERSION>`.
 
 You can list prunable tools with `mise ls --prunable`
 
@@ -27,7 +27,7 @@ Do not actually delete anything
 
 ### `--configs`
 
-Prune only tracked and trusted configuration links that point to non-existent configurations
+Prune only tracked and trusted configuration links that point to nonexistent configurations
 
 ### `--dry-run-code`
 

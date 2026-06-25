@@ -12,8 +12,8 @@ use path_absolutize::Absolutize;
 use crate::cli::args::{BackendArg, ToolArg};
 use crate::config::config_file::ConfigFile;
 use crate::config::{Config, ConfigPathOptions, Settings, config_file, resolve_target_config_path};
-use crate::duration::parse_into_timestamp;
 use crate::file::display_path;
+use crate::install_before::resolve_cli_minimum_release_age;
 use crate::registry::REGISTRY;
 use crate::toolset::{
     ConfigScope, InstallOptions, ResolveOptions, ToolRequest, ToolSource, ToolVersion,
@@ -28,15 +28,17 @@ use crate::{config, env, exit, file};
 /// By default, this will use a `mise.toml` file in the current directory.
 /// If multiple config files exist (e.g., both `mise.toml` and `mise.local.toml`),
 /// the lowest precedence file (`mise.toml`) will be used.
-/// See https://mise.jdx.dev/configuration.html#target-file-for-write-operations
+/// See https://mise.en.dev/configuration.html#target-file-for-write-operations
 ///
 /// In the following order:
 ///   - If `--global` is set, it will use the global config file.
 ///   - If `--path` is set, it will use the config file at the given path.
 ///   - If `--env` is set, it will use `mise.<env>.toml`.
-///   - If `MISE_DEFAULT_CONFIG_FILENAME` is set, it will use that instead.
+///   - If [`MISE_DEFAULT_CONFIG_FILENAME`](https://mise.en.dev/configuration.html#mise_default_config_filename) is set, it will use that instead.
 ///   - If `MISE_OVERRIDE_CONFIG_FILENAMES` is set, it will the first from that list.
 ///   - Otherwise just "mise.toml" or global config if cwd is home directory.
+///
+/// Use [`MISE_GLOBAL_CONFIG_FILE`](https://mise.en.dev/configuration.html#mise_global_config_file) to choose a different global config path.
 ///
 /// Use the `--global` flag to use the global config file instead.
 #[derive(Debug, clap::Args)]
@@ -81,12 +83,6 @@ pub struct Use {
     #[clap(short, long, overrides_with_all = & ["global", "env"], value_hint = clap::ValueHint::FilePath)]
     path: Option<PathBuf>,
 
-    /// Only install versions released before this date
-    ///
-    /// Supports absolute dates like "2024-06-01" and relative durations like "90d" or "1y".
-    #[clap(long, verbatim_doc_comment)]
-    before: Option<String>,
-
     /// Like --dry-run but exits with code 1 if there are changes to make
     ///
     /// This is useful for scripts to check if tools need to be added or removed.
@@ -100,22 +96,28 @@ pub struct Use {
     #[clap(long, verbatim_doc_comment, overrides_with = "pin")]
     fuzzy: bool,
 
+    /// Only install versions released before this date or older than this duration
+    ///
+    /// Supports absolute dates like "2024-06-01" and relative durations like "90d" or "1y".
+    #[clap(long, alias = "before", verbatim_doc_comment)]
+    minimum_release_age: Option<String>,
+
     /// Save exact version to config file
     /// e.g.: `mise use --pin node@20` will save 20.0.0 as the version
     /// Set `MISE_PIN=1` to make this the default behavior
     ///
     /// Consider using mise.lock as a better alternative to pinning in mise.toml:
-    /// https://mise.jdx.dev/configuration/settings.html#lockfile
+    /// https://mise.en.dev/configuration/settings.html#lockfile
     #[clap(long, verbatim_doc_comment, overrides_with = "fuzzy")]
     pin: bool,
 
-    /// Directly pipe stdin/stdout/stderr from plugin to user
-    /// Sets `--jobs=1`
+    /// Connect backend install command stdin/stdout/stderr directly to the terminal
+    /// Implies `--jobs=1`
     #[clap(long, overrides_with = "jobs")]
     raw: bool,
 
-    /// Remove the plugin(s) from config file
-    #[clap(long, value_name = "PLUGIN", aliases = ["rm", "unset"])]
+    /// Remove the tool(s) from config file
+    #[clap(long, value_name = "TOOL", aliases = ["rm", "unset"])]
     remove: Vec<BackendArg>,
 }
 
@@ -144,6 +146,10 @@ impl Use {
             latest_versions: false,
             use_locked_version: true,
             before_date: self.get_before_date()?,
+            before_date_from_default: false,
+            offline: false,
+            refresh_remote_versions: false,
+            inactive: false,
         };
         let versions: Vec<_> = self
             .tool
@@ -213,8 +219,8 @@ impl Use {
         if self.global {
             self.warn_if_hidden(&config, cf.get_path()).await;
         }
-        for plugin_name in &self.remove {
-            cf.remove_tool(plugin_name)?;
+        for tool_name in &self.remove {
+            cf.remove_tool(tool_name)?;
         }
 
         if !self.is_dry_run() {
@@ -226,7 +232,13 @@ impl Use {
 
             let config = Config::reset().await?;
             let ts = config.get_toolset().await?;
-            config::rebuild_shims_and_runtime_symlinks(&config, ts, &versions).await?;
+            config::rebuild_shims_and_runtime_symlinks(
+                &config,
+                ts,
+                &versions,
+                crate::lockfile::LockfileUpdateMode::Normal,
+            )
+            .await?;
         }
 
         self.render_success_message(cf.as_ref(), &versions, &self.remove)?;
@@ -274,6 +286,7 @@ impl Use {
             if let Some(tv) = ts.versions.get(targ.ba.as_ref())
                 && let ToolSource::MiseToml(p) | ToolSource::ToolVersions(p) = &tv.source
                 && !file::same_file(p, global)
+                && !config::is_system_config(p)
             {
                 warn(targ, p);
             }
@@ -287,6 +300,7 @@ impl Use {
         remove: &[BackendArg],
     ) -> Result<()> {
         let path = display_path(cf.get_path());
+        let quiet = Settings::get().quiet;
 
         if self.is_dry_run() {
             let mut messages = vec![];
@@ -302,17 +316,19 @@ impl Use {
             }
 
             if !messages.is_empty() {
-                miseprintln!(
-                    "{} would update {} ({})",
-                    style("mise").green(),
-                    style(&path).cyan().for_stderr(),
-                    messages.join(", ")
-                );
+                if !quiet {
+                    miseprintln!(
+                        "{} would update {} ({})",
+                        style("mise").green(),
+                        style(&path).cyan().for_stderr(),
+                        messages.join(", ")
+                    );
+                }
                 if self.dry_run_code {
                     exit::exit(1);
                 }
             }
-        } else {
+        } else if !quiet {
             if !versions.is_empty() {
                 let tools = versions.iter().map(|t| t.style()).join(", ");
                 miseprintln!(
@@ -361,19 +377,16 @@ impl Use {
         }
     }
 
-    /// Get the before_date from the CLI --before flag only.
+    /// Get the minimum_release_age cutoff from the CLI --minimum-release-age flag only.
     /// Per-tool and global setting fallbacks are handled in ToolRequest::resolve.
     fn get_before_date(&self) -> Result<Option<Timestamp>> {
-        if let Some(before) = &self.before {
-            return Ok(Some(parse_into_timestamp(before)?));
-        }
-        Ok(None)
+        resolve_cli_minimum_release_age(self.minimum_release_age.as_deref())
     }
 }
 
 static AFTER_LONG_HELP: &str = color_print::cstr!(
     r#"<bold><underline>Examples:</underline></bold>
-    
+
     # run with no arguments to use the interactive selector
     $ <bold>mise use</bold>
 

@@ -27,9 +27,16 @@ pub async fn fetch_versions(
 ) -> Result<Vec<String>> {
     use crate::http::HTTP;
 
-    // Fetch the content
-    let response = HTTP.get_text(version_list_url).await?;
-    let content = response.trim();
+    let content = if version_regex.is_some() {
+        // When a regex is provided, the caller expects to parse arbitrary
+        // content (including HTML directory listings), so bypass the HTML rejection
+        // in get_text.
+        let resp = HTTP.get_async(version_list_url).await?;
+        resp.text().await?
+    } else {
+        HTTP.get_text(version_list_url).await?
+    };
+    let content = content.trim();
 
     // Parse versions based on format
     parse_version_list(content, version_regex, version_json_path, version_expr)
@@ -45,14 +52,9 @@ pub fn parse_version_list(
     let mut versions = Vec::new();
     let trimmed = content.trim();
 
-    // If an expr is provided, use it to evaluate and extract versions
-    // Fail hard if the expression is invalid - don't silently fall through
-    if let Some(expr_str) = version_expr {
-        versions = eval_version_expr(expr_str, trimmed)?;
-    }
     // If a JSON path is provided (like ".[].version" or ".versions"), try to use it
     // but fall back to text parsing if JSON parsing fails
-    else if let Some(json_path) = version_json_path {
+    if let Some(json_path) = version_json_path {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed)
             && let Ok(extracted) = jq::extract(&json, json_path)
         {
@@ -88,9 +90,13 @@ pub fn parse_version_list(
         }
     }
 
-    // If no versions extracted yet, treat as line-separated or single version
-    // This provides fallback for all cases including failed JSON parsing
-    if versions.is_empty() {
+    // If no versions extracted yet and no explicit extraction method was provided,
+    // treat as line-separated or single version.
+    // When version_regex or version_expr is set, zero matches means the content
+    // didn't contain the expected data — don't fall through to line-splitting
+    // which would emit garbage (e.g. raw HTML lines as "versions").
+    let explicit_method = version_regex.is_some() || version_expr.is_some();
+    if versions.is_empty() && !explicit_method {
         for line in trimmed.lines() {
             let line = line.trim();
             // Skip empty lines and comments
@@ -108,16 +114,29 @@ pub fn parse_version_list(
 
     // DO NOT sort versions here - the backend/upstream determines version order.
     // Sorting is handled elsewhere (e.g., versions host, resolve logic).
+    // When a registry entry needs explicit sorting, it can use version_expr
+    // (e.g. sortVersions) to post-process the extracted versions.
+    // When no other extraction method produced results, the expr operates on
+    // `body` alone (the original behavior).
+    if let Some(expr_str) = version_expr {
+        versions = eval_version_expr(expr_str, trimmed, &versions)?;
+    }
 
     Ok(versions)
 }
 
-/// Evaluate a version expression using expr-lang
-fn eval_version_expr(expr_str: &str, body: &str) -> Result<Vec<String>> {
+/// Evaluate a version expression using expr-lang.
+/// The previously extracted version list is always injected as a `versions`
+/// variable so the expression can post-process it (e.g. sortVersions).
+fn eval_version_expr(expr_str: &str, body: &str, versions: &[String]) -> Result<Vec<String>> {
     use versions::Versioning;
 
     let mut ctx = Context::default();
     ctx.insert("body".to_string(), Value::String(body.to_string()));
+    ctx.insert(
+        "versions".to_string(),
+        Value::Array(versions.iter().map(|v| Value::String(v.clone())).collect()),
+    );
 
     // expr-lang 1.0+ has built-in fromJSON, keys, values, len, toJSON functions
     let mut env = Environment::new();
@@ -398,5 +417,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(versions, vec!["1.0.0", "1.1.0", "1.2.0-rc1"]);
+    }
+
+    #[test]
+    fn test_parse_with_regex_and_version_expr_pipeline() {
+        let content =
+            r#"<a href="4.9.9/">4.9.9</a><a href="4.21.3/">4.21.3</a><a href="4.10.1/">4.10.1</a>"#;
+        let versions = parse_version_list(
+            content,
+            Some(r#"href="(\d+\.\d+\.\d+)/""#),
+            None,
+            Some("sortVersions(versions)"),
+        )
+        .unwrap();
+        assert_eq!(versions, vec!["4.9.9", "4.10.1", "4.21.3"]);
     }
 }

@@ -16,7 +16,7 @@ use crate::backend::backend_type::BackendType;
 use crate::cli::args::BackendArg;
 use crate::cli::version::VERSION_PLAIN;
 use crate::config::config_file;
-use crate::config::{Config, Settings};
+use crate::config::{Config, Settings, global_config_path};
 use crate::file::display_path;
 use crate::plugins::PluginType;
 use crate::registry::REGISTRY;
@@ -56,7 +56,7 @@ impl VersionProvider for MiseVersionProvider {
         let config = Config::get().await.ok()?;
 
         // Get the latest version
-        backend.latest_version(&config, None).await.ok()?
+        backend.latest_version(&config, None, None).await.ok()?
     }
 }
 
@@ -82,6 +82,7 @@ impl BackendProvider for MiseBackendProvider {
                 BackendType::Go => ("go", Some("Install Go modules")),
                 BackendType::Npm => ("npm", Some("Install npm packages globally")),
                 BackendType::Pipx => ("pipx", Some("Install Python CLI tools")),
+                BackendType::Pkgx => ("pkgx", Some("Install pkgx pantry packages")),
                 BackendType::Spm => ("spm", Some("Install Swift packages")),
                 BackendType::Http => ("http", Some("Download files from HTTP URLs")),
                 BackendType::S3 => ("s3", Some("Download from S3 buckets")),
@@ -122,6 +123,9 @@ impl BackendProvider for MiseBackendProvider {
 #[derive(Debug, clap::Args)]
 #[clap(verbatim_doc_comment, after_long_help = AFTER_LONG_HELP)]
 pub struct Edit {
+    /// Edit the global config file (~/.config/mise/config.toml)
+    #[clap(long, short = 'g')]
+    global: bool,
     /// Show what would be generated without writing to file
     #[clap(long, short = 'n')]
     dry_run: bool,
@@ -143,15 +147,32 @@ struct DetectedTool {
 }
 
 impl Edit {
+    pub(crate) fn new(
+        global: bool,
+        dry_run: bool,
+        path: Option<PathBuf>,
+        tool_versions: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            global,
+            dry_run,
+            path,
+            tool_versions,
+        }
+    }
+
     pub async fn run(self) -> Result<()> {
-        let path = self
-            .path
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(&*env::MISE_DEFAULT_CONFIG_FILENAME));
+        let path = if let Some(path) = self.path.clone() {
+            path
+        } else if self.global {
+            global_config_path()
+        } else {
+            PathBuf::from(&*env::MISE_DEFAULT_CONFIG_FILENAME)
+        };
 
         if let Some(tool_versions) = &self.tool_versions {
             // Import from .tool-versions file
-            let doc = self.tool_versions(tool_versions).await?;
+            let doc = self.tool_versions(tool_versions, &path).await?;
 
             if self.dry_run {
                 info!("would write to {}", display_path(&path));
@@ -215,13 +236,13 @@ impl Edit {
             editor.add_tool(&tool.name, &version);
         }
 
-        // Auto-detect prepare providers if experimental is enabled
+        // Auto-detect deps providers if experimental is enabled
         if Settings::get().experimental {
-            pr.set_message("Detecting prepare providers...".into());
+            pr.set_message("Detecting deps providers...".into());
             let cwd = env::current_dir().unwrap_or_default();
-            let prepare_providers = crate::prepare::detect_applicable_providers(&cwd);
-            for provider in prepare_providers {
-                editor.add_prepare(&provider);
+            let deps_providers = crate::deps::detect_applicable_providers(&cwd);
+            for provider in deps_providers {
+                editor.add_deps(&provider);
             }
         }
 
@@ -250,9 +271,8 @@ impl Edit {
         Ok(())
     }
 
-    async fn tool_versions(&self, tool_versions: &Path) -> Result<String> {
-        let to =
-            config_file::parse_or_init(&PathBuf::from(&*env::MISE_DEFAULT_CONFIG_FILENAME)).await?;
+    async fn tool_versions(&self, tool_versions: &Path, path: &Path) -> Result<String> {
+        let to = config_file::parse_or_init(path).await?;
         let from = config_file::parse(tool_versions).await?;
         let tools = from.to_tool_request_set()?.tools;
         for (ba, tools) in tools {
@@ -305,21 +325,19 @@ fn detect_tools() -> Vec<DetectedTool> {
 
         for detect_file in tool.detect.iter() {
             let path = cwd.join(detect_file);
-            if path.exists() && !seen_tools.contains(*name) {
+            if path.exists() && !seen_tools.contains(name) {
                 let version = extract_version(name, &path);
                 detected.push(DetectedTool {
                     name: name.to_string(),
                     version,
                     source: detect_file.to_string(),
                 });
-                seen_tools.insert(*name);
+                seen_tools.insert(name);
                 break; // Only detect once per tool
             }
         }
     }
 
-    // Sort by tool name for consistent output
-    detected.sort_by(|a, b| a.name.cmp(&b.name));
     detected
 }
 
@@ -366,11 +384,12 @@ fn extract_version(tool: &str, path: &Path) -> Option<String> {
     }
 }
 
-pub static AFTER_LONG_HELP: &str = color_print::cstr!(
+static AFTER_LONG_HELP: &str = color_print::cstr!(
     r#"<bold><underline>Examples:</underline></bold>
 
     $ <bold>mise edit</bold>             <dim># edit mise.toml interactively</dim>
     $ <bold>mise edit .mise.toml</bold>  <dim># edit a specific file</dim>
+    $ <bold>mise edit -g</bold>          <dim># edit the global config file</dim>
     $ <bold>mise edit -y</bold>          <dim># skip interactive editor</dim>
     $ <bold>mise edit -n</bold>          <dim># preview without writing</dim>
 "#

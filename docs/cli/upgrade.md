@@ -11,7 +11,7 @@ By default, this keeps the range specified in mise.toml. So if you have node@20 
 upgrade to the latest 20.x.x version available. See the `--bump` flag to use the latest version
 and bump the version in mise.toml.
 
-This will update mise.lock if it is enabled, see <https://mise.jdx.dev/configuration/settings.html#lockfile>
+This will update mise.lock if it is enabled, see <https://mise.en.dev/configuration/settings.html#lockfile>
 
 ## Arguments
 
@@ -51,21 +51,15 @@ Just print what would be done, don't actually do it
 Tool(s) to exclude from upgrading
 e.g.: go python
 
-### `--before <BEFORE>`
-
-Only upgrade to versions released before this date
-
-Supports absolute dates like "2024-06-01" and relative durations like "90d" or "1y".
-This can be useful for reproducibility or security purposes.
-
-This only affects fuzzy version matches like "20" or "latest".
-Explicitly pinned versions like "22.5.0" are not filtered.
-
 ### `--dry-run-code`
 
 Like --dry-run but exits with code 1 if there are outdated tools
 
 This is useful for scripts to check if tools need to be upgraded.
+
+### `--inactive`
+
+Upgrade all tools, including installed-but-inactive tools not present in the current config
 
 ### `--local`
 
@@ -74,9 +68,19 @@ Only upgrade tools defined in local config files
 This will only upgrade tools that are defined in project-local mise.toml and
 will skip tools defined in the global config (~/.config/mise/config.toml).
 
+### `--minimum-release-age <MINIMUM_RELEASE_AGE>`
+
+Only upgrade to versions released before this date or older than this duration
+
+Supports absolute dates like "2024-06-01" and relative durations like "90d" or "1y".
+This can be useful for reproducibility or security purposes.
+
+This only affects fuzzy version matches like "20" or "latest".
+Explicitly pinned versions like "22.5.0" are not filtered.
+
 ### `--raw`
 
-Directly pipe stdin/stdout/stderr from plugin to user Sets --jobs=1
+Connect backend install command stdin/stdout/stderr directly to the terminal Implies --jobs=1
 
 Examples:
 

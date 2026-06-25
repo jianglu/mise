@@ -34,6 +34,10 @@ mise use --pin dummy@1
 assert "cat mise.toml" '[tools]
 dummy = "1.0.0"'
 
+assert_fail "mise use dummy@--version" "must not start with '-'"
+assert "cat mise.toml" '[tools]
+dummy = "1.0.0"'
+
 MISE_PIN=1 mise use --fuzzy dummy@1
 assert "cat mise.toml" '[tools]
 dummy = "1"'
@@ -41,6 +45,8 @@ dummy = "1"'
 MISE_PIN=1 mise use dummy@1 --path mise.local.toml
 assert "cat mise.local.toml" '[tools]
 dummy = "1.0.0"'
+
+assert_fail "mise use --dry-run --path package.json dummy@1" "cannot update idiomatic version file"
 
 mise use --rm dummy --path mise.local.toml
 assert "cat mise.local.toml" ""
@@ -92,6 +98,14 @@ assert "cat .tool-versions" "dummy 2"
 rm -f .tool-versions mise.toml
 
 mise use -g dummy@1
+assert "cat ~/.config/mise/config.toml" '[tools]
+dummy = "1"'
+rm -f ~/.config/mise/config.toml
+
+assert_empty "mise use --quiet -g dummy@1 2>&1"
+assert "cat ~/.config/mise/config.toml" '[tools]
+dummy = "1"'
+assert_empty "mise use --silent -g dummy@1 2>&1"
 assert "cat ~/.config/mise/config.toml" '[tools]
 dummy = "1"'
 rm -f ~/.config/mise/config.toml

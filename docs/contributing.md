@@ -4,37 +4,48 @@ outline: [1, 3]
 
 # Contributing
 
-Before submitting a PR, unless it's something obvious, consider creating a
-[discussion](https://github.com/jdx/mise/discussions)
-or simply mention what you plan to do in the
-[Discord](https://discord.gg/UBa7pJUN7Z).
-PRs are often either rejected or need to change significantly after submission
-so make sure before you start working on something it won't be a wasted effort.
+## Contribution Expectations
 
-## Contributing Guidelines
+mise has a specific scope and design taste. Before opening a PR, unless it is
+something obvious, start a
+[discussion](https://github.com/jdx/mise/discussions) or mention what you plan
+to do in [Discord](https://discord.gg/UBa7pJUN7Z). The important part is to
+settle the direction before much implementation or review happens. PRs are
+often either rejected or need to change significantly after submission, so make
+sure the idea fits before you invest too much time.
 
-1. **Before starting**: Create a discussion or discuss in Discord for non-obvious changes
-2. **Test thoroughly**: Ensure both unit and E2E tests pass
-3. **Follow conventions**: Use existing code style and patterns
-4. **Update documentation**: Add/update docs for new features
+Before I review a PR, CI must be passing, the PR title must follow
+[Conventional Commits](#conventional-commits), and all automated AI review
+comments must be addressed. If any of those are still open, assume I will wait
+to look at the PR.
 
-### Pull Request Workflow
+If I am on the fence about a contribution, I will probably reject it for that
+reason alone. If I did not do this, mise would suffer from feature bloat. I
+may also reject a PR if the quality is poor enough that I do not have confidence
+the contributor can get it across the finish line. I do not have time to coach
+contributors.
 
-1. **PR titles**: Must follow conventional commit format (validated
-   automatically)
+I get hundreds of PRs per week across my projects, so I do not have time to
+respond to every PR with detailed context. A rejection may be brief.
+
+## Pull Request Checklist
+
+1. **Discuss first**: Use GitHub Discussions or Discord for non-obvious changes
+2. **Use a conventional title**: PR titles are validated automatically
    - For new tools in registry: Use `registry: add tool-name (backend:full/name)`
-2. **Auto-formatting**: Code will be automatically formatted by autofix.ci
-3. **CI checks**: All tests must pass across Linux, macOS, and Windows
-4. **Coverage**: New code should maintain or improve test coverage
-5. **Dependencies**: New dependencies are validated with cargo-deny
+3. **Run local checks**: Run `mise run render` and `mise run lint-fix` before
+   opening a PR when relevant
+4. **Test thoroughly**: Ensure the relevant unit and E2E tests pass
+5. **Update documentation**: Add or update docs for user-facing changes
+6. **Keep dependencies healthy**: New dependencies are validated with cargo-deny
 
 ### Development Tips
 
 1. **Disable mise during development**: If you use mise in your shell, disable
    it when running tests to avoid conflicts
 2. **Test specific features**: Use `cargo test test_name` for targeted testing
-4. **Update snapshots**: Use `mise run snapshots` when changing test outputs
-5. **Rate limiting**: Set `MISE_GITHUB_TOKEN` to avoid GitHub API rate limits
+3. **Update snapshots**: Use `mise run snapshots` when changing test outputs
+4. **Rate limiting**: Set `MISE_GITHUB_TOKEN` to avoid GitHub API rate limits
    during development
 
 ## Packaging and Self-Update Instructions
@@ -556,11 +567,12 @@ BREAKING CHANGE: The old configuration format is no longer supported
 mise uses several automated workflows to maintain code quality and streamline
 development:
 
-### Automated Code Formatting
+### Formatting and Linting
 
-- **autofix.ci**: Automatically formats code and fixes linting issues in PRs
-- Runs `mise run render` and `mise run lint-fix` automatically
-- Commits fixes directly to the PR branch
+- Run `mise run render` and `mise run lint-fix` before opening a PR
+- Generated docs, completions, and snapshots should be committed with the
+  change that requires them
+- PRs with formatting or lint failures should be fixed by the contributor
 
 ### PR Title Validation
 
@@ -624,13 +636,53 @@ of the full backend specification.
 When adding a new tool, the following requirements apply (automatically
 enforced by [GitHub Actions workflow](https://github.com/jdx/mise/blob/main/.github/workflows/registry_comment.yml)):
 
-- **New asdf plugins are not accepted** - Use aqua/github instead
 - **A test is required in `registry/`** - Must include a `test` field to
-  verify installation
+  verify installation.
 - **Tools may be rejected if they are not notable** - The tool should be
   reasonably popular and well-maintained. There are no specific guidelines for this and
   a lot of factors are taken into account. @jdx won't explain why a given tool wasn't
-  accepted.
+  accepted. Include a brief popularity summary (stars, downloads, recent release date) in
+  the PR description so the policy can be applied without re-doing the research.
+
+#### Backend acceptance tiers
+
+Which backend you choose for a registry entry matters as much as which tool you
+add. Backends fall into the following tiers:
+
+**Tier 1 — preferred, routinely accepted:** [`aqua`](/dev-tools/backends/aqua.html),
+[`github`](/dev-tools/backends/github.html), and [`gitlab`](/dev-tools/backends/gitlab.html).
+
+- Prefer `aqua` when the tool is in the [aqua registry](https://github.com/aquaproj/aqua-registry) —
+  it has better UX, SLSA verification, and per-version logic.
+- Use `github` when the tool isn't in aqua but ships GitHub releases.
+- Use `gitlab` for tools released through GitLab.
+
+**Tier 2 — high bar, but lower than tier 3:** [`conda`](/dev-tools/backends/conda.html).
+
+Potentially accepted for tools that can't reasonably be supported via aqua/github.
+The bar is lower than tier 3 because **mise's conda backend does not require a
+separately-installed package manager** — packages are downloaded and extracted
+directly from anaconda.org, with no `conda`/`mamba`/`micromamba` needed on the
+user's PATH. The tool still needs to be popular and well-maintained.
+
+**Tier 3 — very high bar, rarely accepted:** `npm`, `pipx`, `gem`, `cargo`, `go`, `dotnet`.
+
+These all depend on a separately-installed runtime or toolchain being present on
+the user's PATH (`node`, `python`, `ruby`, `cargo`, `go`, `dotnet`), which is
+fragile — `npm`/`pipx`/`gem` in particular silently bind tools to whichever
+`node`/`python`/`ruby` happened to be on PATH at install time, which breaks when
+versions change or the runtime isn't installed. Accepted only when no aqua/github
+option exists and the tool is widely used. Discuss with @jdx before submitting.
+
+**Not accepted:** `asdf`, `vfox`, `ubi`.
+
+- **New `asdf` plugins** — supply-chain security. Use [aqua](/dev-tools/backends/aqua.html) or [github](/dev-tools/backends/github.html) instead.
+- **New `vfox` plugins** — same reason. Use aqua/github instead.
+- **`ubi`** is deprecated and is not accepted for new registry entries.
+
+Users can still install via any backend themselves with explicit syntax
+(`mise use vfox:owner/repo`, `mise use cargo:name`, etc.) — they just don't get
+a registry shorthand for it.
 
 ### Registry Format
 
@@ -642,8 +694,7 @@ The `registry/` file uses this format:
 description = "Tool description"
 backends = [
     "aqua:owner/repo",           # Preferred backend first
-    "github:owner/repo",         # Fallback backends
-    "npm:package-name"           # Multiple backends supported
+    "github:owner/repo",         # Fallback backend
 ]
 test = [
     "your-tool --version",       # Command to run
@@ -657,20 +708,27 @@ os = ["linux", "macos"] # Optional OS restrictions
 
 List backends in order of preference. Users will get the first available
 backend, but can override with explicit syntax like `mise use aqua:owner/repo`.
+Only include `npm` as a fallback for a tool that already has a non-npm primary
+backend when the npm package works with lifecycle scripts disabled.
 
 ### Tool Testing
 
 All tools must include a test to verify proper installation:
 
 ```toml
-test = [
-    "command-to-run",
-    "expected-output-pattern"
-]
+test = { cmd = "command-to-run", expected = "expected-output-pattern" }
 ```
 
 The test command should be reliable and the output pattern should use
 <code v-pre>{{version}}</code> to match any version number.
+
+If `test.cmd` needs extra mise-managed tools on PATH, declare them with
+`test.tools`. This is used only by `mise test-tool`; it does not affect normal
+tool installation.
+
+```toml
+test = { cmd = "gradle -V", expected = "Gradle", tools = ["java"] }
+```
 
 ### Registry Examples
 
@@ -816,9 +874,9 @@ docker run -ti --rm ubuntu
 apt update -y
 apt install -y curl
 install -dm 755 /etc/apt/keyrings
-curl -fSso /etc/apt/keyrings/mise-archive-keyring.pub https://mise.jdx.dev/gpg-key.pub
+curl -fSso /etc/apt/keyrings/mise-archive-keyring.pub https://mise.en.dev/gpg-key.pub
 echo "deb [signed-by=/etc/apt/keyrings/mise-archive-keyring.pub arch=arm64] \
-https://mise.jdx.dev/deb stable main" >/etc/apt/sources.list.d/mise.list
+https://mise.en.dev/deb stable main" >/etc/apt/sources.list.d/mise.list
 apt update -y
 apt install -y mise
 mise -V

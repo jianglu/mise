@@ -40,6 +40,7 @@ impl InstallInto {
             .first()
             .unwrap()
             .clone();
+        let before_date = tv.before_date;
         let backend = tv.backend()?;
         let mpr = MultiProgressReport::get();
         let install_ctx = InstallContext {
@@ -49,6 +50,7 @@ impl InstallInto {
             force: true,
             dry_run: false,
             locked: false, // install-into doesn't support locked mode
+            before_date,
         };
         tv.install_path = Some(self.path.clone());
         backend.install_version(install_ctx, tv).await?;

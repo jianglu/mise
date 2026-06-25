@@ -57,7 +57,7 @@ pub fn append_self_update_instructions(mut message: String) -> String {
 ///
 /// Uses the GitHub Releases API to find the latest release and binary.
 /// By default, this will also update any installed plugins.
-/// Uses the `GITHUB_API_TOKEN` environment variable if set for higher rate limits.
+/// Uses mise's GitHub token resolution chain for authenticated requests.
 ///
 /// This command is not available if mise is installed via a package manager.
 #[derive(Debug, Default, clap::Args)]
@@ -93,9 +93,20 @@ impl SelfUpdate {
             let version = status.version().to_string();
             let styled_version = style(&version).bright().yellow();
             miseprintln!("Updated mise to {styled_version}");
+            // On Windows, "exe"/"hardlink" shims are copies of mise-shim.exe and
+            // go stale after an update. Refresh mise-shim.exe, and ONLY if that
+            // succeeds rebuild the shim copies from it. Reshimming on failure
+            // would re-copy the OLD mise-shim.exe yet still stamp the new version
+            // in the `.version` marker, masking the staleness from future
+            // (non-forced) reshims. Best-effort. See discussion #10022.
             #[cfg(windows)]
-            if let Err(e) = Self::update_mise_shim(&version).await {
-                warn!("Failed to update mise-shim.exe: {e}");
+            match Self::update_mise_shim(&version).await {
+                Ok(()) => {
+                    if let Err(e) = Self::reshim_after_update().await {
+                        warn!("Failed to reshim after self-update: {e}");
+                    }
+                }
+                Err(e) => warn!("Failed to update mise-shim.exe: {e}"),
             }
         } else {
             miseprintln!("mise is already up to date");
@@ -115,8 +126,8 @@ impl SelfUpdate {
 
     fn do_update_blocking(&self) -> Result<Status> {
         let mut update = Update::configure();
-        if let Some(token) = &*env::GITHUB_TOKEN {
-            update.auth_token(token);
+        if let Some((token, _)) = crate::github::resolve_token("github.com") {
+            update.auth_token(&token);
         }
         #[cfg(windows)]
         let bin_path_in_archive = "mise/bin/mise.exe";
@@ -170,6 +181,18 @@ impl SelfUpdate {
         }
 
         Ok(status)
+    }
+
+    // Rebuild the Windows shim copies in-process instead of shelling out to
+    // `mise reshim --force`. Mirrors `cli::reshim::Reshim::run`.
+    #[cfg(windows)]
+    async fn reshim_after_update() -> Result<()> {
+        use crate::config::Config;
+        use crate::toolset::ToolsetBuilder;
+
+        let config = Config::get().await?;
+        let ts = ToolsetBuilder::new().build(&config).await?;
+        crate::shims::reshim(&config, &ts, true).await
     }
 
     #[cfg(windows)]

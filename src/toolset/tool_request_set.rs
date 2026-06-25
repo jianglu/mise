@@ -137,7 +137,7 @@ pub struct ToolRequestSetBuilder {
     /// tools which will be disabled
     disable_tools: BTreeSet<BackendArg>,
     /// tools which will be enabled
-    enable_tools: BTreeSet<BackendArg>,
+    enable_tools: Option<BTreeSet<BackendArg>>,
 }
 
 impl ToolRequestSetBuilder {
@@ -145,7 +145,9 @@ impl ToolRequestSetBuilder {
         let settings = Settings::get();
         Self {
             disable_tools: settings.disable_tools().iter().map(|s| s.into()).collect(),
-            enable_tools: settings.enable_tools().iter().map(|s| s.into()).collect(),
+            enable_tools: settings
+                .enable_tools()
+                .map(|tools| tools.iter().map(|s| s.into()).collect()),
             ..Default::default()
         }
     }
@@ -169,8 +171,11 @@ impl ToolRequestSetBuilder {
 
         for ba in trs.tools.keys().cloned().collect_vec() {
             if self.is_disabled(&ba) {
-                // Track tools that don't exist in the registry
-                if ba.backend_type() == BackendType::Unknown {
+                if trs
+                    .tools
+                    .get(&ba)
+                    .is_some_and(|requests| self.should_report_unknown_tool(&ba, requests))
+                {
                     trs.unknown_tools.push(ba.clone());
                 }
                 trs.tools.shift_remove(&ba);
@@ -187,7 +192,13 @@ impl ToolRequestSetBuilder {
         backend_type == BackendType::Unknown
             || (cfg!(windows) && backend_type == BackendType::Asdf)
             || !ba.is_os_supported()
-            || !tool_enabled(&self.enable_tools, &self.disable_tools, ba)
+            || !tool_enabled(self.enable_tools.as_ref(), &self.disable_tools, ba)
+    }
+
+    fn should_report_unknown_tool(&self, ba: &BackendArg, requests: &[ToolRequest]) -> bool {
+        ba.backend_type() == BackendType::Unknown
+            && tool_enabled(self.enable_tools.as_ref(), &self.disable_tools, ba)
+            && requests.iter().any(ToolRequest::is_os_supported)
     }
 
     async fn load_config_files(
@@ -202,25 +213,15 @@ impl ToolRequestSetBuilder {
     }
 
     fn load_runtime_env(&self, mut trs: ToolRequestSet) -> eyre::Result<ToolRequestSet> {
-        for (k, v) in env::vars_safe() {
-            if k.starts_with("MISE_") && k.ends_with("_VERSION") && k != "MISE_VERSION" {
-                let plugin_name = k
-                    .trim_start_matches("MISE_")
-                    .trim_end_matches("_VERSION")
-                    .to_lowercase();
-                if plugin_name == "install" || plugin_name == "tool" {
-                    // ignore MISE_INSTALL_VERSION and MISE_TOOL_VERSION (set during hooks)
-                    continue;
-                }
-                let ba: Arc<BackendArg> = Arc::new(plugin_name.as_str().into());
-                let source = ToolSource::Environment(k, v.clone());
-                let mut env_ts = ToolRequestSet::new();
-                for v in v.split_whitespace() {
-                    let tvr = ToolRequest::new(ba.clone(), v, source.clone())?;
-                    env_ts.add_version(tvr, &source);
-                }
-                trs = merge(trs, env_ts);
+        for (short, k, v) in tool_env_vars() {
+            let ba: Arc<BackendArg> = Arc::new(short.as_str().into());
+            let source = ToolSource::Environment(k, v.clone());
+            let mut env_ts = ToolRequestSet::new();
+            for v in v.split_whitespace() {
+                let tvr = ToolRequest::new(ba.clone(), v, source.clone())?;
+                env_ts.add_version(tvr, &source);
             }
+            trs = merge(trs, env_ts);
         }
         Ok(trs)
     }
@@ -283,9 +284,31 @@ fn merge(mut a: ToolRequestSet, mut b: ToolRequestSet) -> ToolRequestSet {
     b
 }
 
+/// Yields `(short, key, value)` for each `MISE_<TOOL>_VERSION` env var that
+/// maps to a tool. `short` is the unaliased backend short name (so
+/// `MISE_NODEJS_VERSION` yields `"node"`). Skips `MISE_VERSION` and the
+/// `MISE_INSTALL_VERSION` / `MISE_TOOL_VERSION` vars set during hooks.
+pub fn tool_env_vars() -> impl Iterator<Item = (String, String, String)> {
+    env::vars_safe().filter_map(|(k, v)| {
+        if !k.starts_with("MISE_") || !k.ends_with("_VERSION") || k == "MISE_VERSION" {
+            return None;
+        }
+        let raw = k
+            .trim_start_matches("MISE_")
+            .trim_end_matches("_VERSION")
+            .to_lowercase();
+        if raw == "install" || raw == "tool" {
+            return None;
+        }
+        let short = crate::backend::unalias_backend(&raw).to_string();
+        Some((short, k, v))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::toolset::{CoreToolOptions, ToolVersionOptions};
 
     #[test]
     fn test_load_runtime_env_with_valid_utf8() {
@@ -310,6 +333,58 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_env_vars_unaliases_backend() {
+        // MISE_NODEJS_VERSION should yield "node" (the unaliased backend
+        // short name), not "nodejs" — otherwise the install command's
+        // configured-tool check fails to match unaliased ToolArg shorts.
+        unsafe {
+            std::env::set_var("MISE_NODEJS_VERSION", "22.0.0");
+            std::env::set_var("MISE_GOLANG_VERSION", "1.22.0");
+        }
+
+        let entries: Vec<(String, String, String)> = tool_env_vars()
+            .filter(|(_, k, _)| k == "MISE_NODEJS_VERSION" || k == "MISE_GOLANG_VERSION")
+            .collect();
+
+        let nodejs = entries
+            .iter()
+            .find(|(_, k, _)| k == "MISE_NODEJS_VERSION")
+            .expect("MISE_NODEJS_VERSION should yield an entry");
+        assert_eq!(nodejs.0, "node");
+
+        let golang = entries
+            .iter()
+            .find(|(_, k, _)| k == "MISE_GOLANG_VERSION")
+            .expect("MISE_GOLANG_VERSION should yield an entry");
+        assert_eq!(golang.0, "go");
+
+        unsafe {
+            std::env::remove_var("MISE_NODEJS_VERSION");
+            std::env::remove_var("MISE_GOLANG_VERSION");
+        }
+    }
+
+    #[test]
+    fn test_tool_env_vars_skips_non_tool_vars() {
+        unsafe {
+            std::env::set_var("MISE_VERSION", "2026.4.28");
+            std::env::set_var("MISE_INSTALL_VERSION", "1.0.0");
+            std::env::set_var("MISE_TOOL_VERSION", "1.0.0");
+        }
+
+        let keys: HashSet<String> = tool_env_vars().map(|(_, k, _)| k).collect();
+        assert!(!keys.contains("MISE_VERSION"));
+        assert!(!keys.contains("MISE_INSTALL_VERSION"));
+        assert!(!keys.contains("MISE_TOOL_VERSION"));
+
+        unsafe {
+            std::env::remove_var("MISE_VERSION");
+            std::env::remove_var("MISE_INSTALL_VERSION");
+            std::env::remove_var("MISE_TOOL_VERSION");
+        }
+    }
+
+    #[test]
     fn test_load_runtime_env_ignores_non_mise_vars() {
         // Non-MISE variables should be ignored, even with special characters
         unsafe {
@@ -327,5 +402,67 @@ mod tests {
             std::env::remove_var("HOMEBREW_INSTALL_BADGE");
             std::env::remove_var("SOME_OTHER_VAR");
         }
+    }
+
+    fn unknown_tool_request(os: Option<Vec<String>>) -> (Arc<BackendArg>, Vec<ToolRequest>) {
+        let ba = Arc::new(BackendArg::from("unknown-os-filtered-tool"));
+        let options = ToolVersionOptions {
+            core: CoreToolOptions {
+                os,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let request =
+            ToolRequest::new_opts(ba.clone(), "latest", options, ToolSource::Unknown).unwrap();
+        (ba, vec![request])
+    }
+
+    fn inactive_os() -> String {
+        match crate::cli::version::OS.as_str() {
+            "linux" => "macos",
+            _ => "linux",
+        }
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_should_not_report_unknown_tool_when_all_requests_are_os_inactive() {
+        crate::toolset::install_state::init().await.unwrap();
+        let builder = ToolRequestSetBuilder::default();
+        let (ba, requests) = unknown_tool_request(Some(vec![inactive_os()]));
+
+        assert!(!builder.should_report_unknown_tool(&ba, &requests));
+    }
+
+    #[tokio::test]
+    async fn test_should_report_unknown_tool_when_any_request_is_os_active() {
+        crate::toolset::install_state::init().await.unwrap();
+        let builder = ToolRequestSetBuilder::default();
+        let (ba, mut requests) = unknown_tool_request(Some(vec![inactive_os()]));
+        let options = ToolVersionOptions {
+            core: CoreToolOptions {
+                os: Some(vec![crate::cli::version::OS.to_string()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        requests.push(
+            ToolRequest::new_opts(ba.clone(), "latest", options, ToolSource::Unknown).unwrap(),
+        );
+
+        assert!(builder.should_report_unknown_tool(&ba, &requests));
+    }
+
+    #[tokio::test]
+    async fn test_should_not_report_unknown_tool_when_tool_is_disabled() {
+        crate::toolset::install_state::init().await.unwrap();
+        let (ba, requests) = unknown_tool_request(None);
+        let builder = ToolRequestSetBuilder {
+            disable_tools: BTreeSet::from([BackendArg::from("unknown-os-filtered-tool")]),
+            ..Default::default()
+        };
+
+        assert!(!builder.should_report_unknown_tool(&ba, &requests));
     }
 }

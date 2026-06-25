@@ -77,10 +77,11 @@ Fetch GPG keys for signing or verification
 
 ## `filetask`
 
+This is a test build script
+
+
 - **Usage**: `filetask [-f --force] [-u --user <user>] [file] [arg_with_default]`
 - **Aliases**: `ft`
-
-This is a test build script
 
 ### Arguments
 
@@ -244,9 +245,10 @@ run all tests
 
 ## `test-tool-retry`
 
-- **Usage**: `test-tool-retry [--grace-period] <tools>…`
-
 Retry failed test-tools with grace period for recent upstream releases
+
+
+- **Usage**: `test-tool-retry [--grace-period] [--check-only] <tools>…`
 
 ### Arguments
 
@@ -259,6 +261,10 @@ Failed tools to retry
 #### `--grace-period`
 
 Ignore failures from tools whose upstream released &lt;7 days ago
+
+#### `--check-only`
+
+Skip retrying tools, only check grace period (use with --grace-period)
 
 ## `test:build-perf-workspace`
 

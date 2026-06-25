@@ -6,14 +6,13 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
-use eyre::{Report, Result, bail, ensure};
+use eyre::{Report, Result, bail, ensure, eyre};
 use regex::Regex;
-use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::StatusCode;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::{ClientBuilder, IntoUrl, Method, Response};
 use std::sync::LazyLock as Lazy;
 use tokio::sync::OnceCell;
-use tokio_retry::Retry;
-use tokio_retry::strategy::{ExponentialBackoff, jitter};
 use url::Url;
 
 use crate::cli::version;
@@ -23,10 +22,6 @@ use crate::netrc;
 use crate::ui::progress_report::SingleReport;
 use crate::ui::time::format_duration;
 use crate::{env, file};
-
-#[cfg(not(test))]
-pub static HTTP_VERSION_CHECK: Lazy<Client> =
-    Lazy::new(|| Client::new(Duration::from_secs(3), ClientKind::VersionCheck).unwrap());
 
 pub static HTTP: Lazy<Client> =
     Lazy::new(|| Client::new(Settings::get().http_timeout(), ClientKind::Http).unwrap());
@@ -46,6 +41,45 @@ pub static HTTP_FETCH: Lazy<Client> = Lazy::new(|| {
 type CachedResult = Arc<OnceCell<Result<String, String>>>;
 static HTTP_CACHE: Lazy<Mutex<HashMap<String, CachedResult>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+type RetryStateHandle = Arc<Mutex<RetryState>>;
+
+struct RetryState {
+    headers: HeaderMap,
+    use_netrc: bool,
+}
+
+#[derive(Clone)]
+struct SendOnceOptions {
+    use_netrc: bool,
+    retry_github_oauth_401: bool,
+    error_for_status: bool,
+    retry_state: Option<RetryStateHandle>,
+}
+
+impl SendOnceOptions {
+    fn new(retry_state: Option<RetryStateHandle>, use_netrc: bool) -> Self {
+        Self {
+            use_netrc,
+            retry_github_oauth_401: true,
+            error_for_status: true,
+            retry_state,
+        }
+    }
+
+    fn allow_error_status(mut self) -> Self {
+        self.error_for_status = false;
+        self
+    }
+
+    fn recursive_retry(&self) -> Self {
+        Self {
+            use_netrc: false,
+            retry_github_oauth_401: false,
+            error_for_status: self.error_for_status,
+            retry_state: self.retry_state.clone(),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct Client {
@@ -58,8 +92,6 @@ pub struct Client {
 enum ClientKind {
     Http,
     Fetch,
-    #[allow(dead_code)]
-    VersionCheck,
 }
 
 impl Client {
@@ -72,6 +104,15 @@ impl Client {
             timeout,
             kind,
         })
+    }
+
+    /// Underlying reqwest client. Use sparingly — most callers should reach for
+    /// the higher-level `get_*`/`json_*`/`post_json_*` helpers instead. This
+    /// exists for callers that need request shapes those helpers don't cover
+    /// (e.g. form-encoded POST in the GitHub OAuth flow) but still want the
+    /// shared timeouts, gzip, and user-agent.
+    pub fn reqwest(&self) -> &reqwest::Client {
+        &self.reqwest
     }
 
     fn _new() -> ClientBuilder {
@@ -89,9 +130,25 @@ impl Client {
         Ok(resp.bytes().await?)
     }
 
-    pub async fn get_async<U: IntoUrl>(&self, url: U) -> Result<Response> {
+    /// Like `get_bytes`, but lets the caller supply the exact headers used
+    /// for the request. Does NOT merge `host_auth_headers` — this mirrors
+    /// `json_headers_with_headers` so callers get consistent behavior
+    /// between manifest JSON fetches and blob byte fetches to the same host
+    /// (e.g. `ghcr.io`, where the OCI Bearer token must not be mixed with
+    /// the GitHub token that host_auth_headers would inject).
+    pub async fn get_bytes_with_headers<U: IntoUrl>(
+        &self,
+        url: U,
+        headers: &HeaderMap,
+    ) -> Result<impl AsRef<[u8]>> {
         let url = url.into_url().unwrap();
-        let headers = github_headers(&url);
+        let resp = self.get_async_with_headers(url, headers).await?;
+        Ok(resp.bytes().await?)
+    }
+
+    pub async fn get_async<U: IntoUrl>(&self, url: U) -> Result<Response> {
+        let url = url.into_url()?;
+        let headers = host_auth_headers(&url)?;
         self.get_async_with_headers(url, &headers).await
     }
 
@@ -109,9 +166,20 @@ impl Client {
         Ok(resp)
     }
 
-    pub async fn head<U: IntoUrl>(&self, url: U) -> Result<Response> {
+    pub async fn get_async_with_headers_allow_error_status<U: IntoUrl>(
+        &self,
+        url: U,
+        headers: &HeaderMap,
+    ) -> Result<Response> {
+        ensure!(!Settings::get().offline(), "offline mode is enabled");
         let url = url.into_url().unwrap();
-        let headers = github_headers(&url);
+        self.send_with_https_fallback_allow_error_status(Method::GET, url, headers, "GET")
+            .await
+    }
+
+    pub async fn head<U: IntoUrl>(&self, url: U) -> Result<Response> {
+        let url = url.into_url()?;
+        let headers = host_auth_headers(&url)?;
         self.head_async_with_headers(url, &headers).await
     }
 
@@ -130,29 +198,16 @@ impl Client {
     }
 
     pub async fn get_text<U: IntoUrl>(&self, url: U) -> Result<String> {
-        self.get_text_with_headers(url, &HeaderMap::new()).await
+        self.get_text_request(url).send().await
     }
 
-    pub async fn get_text_with_headers<U: IntoUrl>(
-        &self,
-        url: U,
-        extra_headers: &HeaderMap,
-    ) -> Result<String> {
-        let mut url = url.into_url().unwrap();
-        // Merge GitHub headers with any extra headers provided
-        let mut headers = github_headers(&url);
-        headers.extend(extra_headers.clone());
-        let resp = self.get_async_with_headers(url.clone(), &headers).await?;
-        let text = resp.text().await?;
-        if text.starts_with("<!DOCTYPE html>") {
-            if url.scheme() == "http" {
-                // try with https since http may be blocked
-                url.set_scheme("https").unwrap();
-                return Box::pin(self.get_text_with_headers(url, extra_headers)).await;
-            }
-            bail!("Got HTML instead of text from {}", url);
+    pub fn get_text_request<U: IntoUrl>(&self, url: U) -> TextRequest<'_> {
+        TextRequest {
+            client: self,
+            url: url.into_url().unwrap(),
+            extra_headers: HeaderMap::new(),
+            retries: Settings::get().http_retries,
         }
-        Ok(text)
     }
 
     /// Like get_text but caches results in memory for the duration of the process.
@@ -191,10 +246,21 @@ impl Client {
     pub async fn get_html<U: IntoUrl>(&self, url: U) -> Result<String> {
         let url = url.into_url().unwrap();
         let resp = self.get_async(url.clone()).await?;
-        let html = resp.text().await?;
-        if !html.starts_with("<!DOCTYPE html>") {
+        let is_html = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|content_type| content_type.to_str().ok())
+            .is_some_and(|content_type| {
+                content_type
+                    .split_once(';')
+                    .map_or(content_type, |(media_type, _)| media_type)
+                    .trim()
+                    .eq_ignore_ascii_case("text/html")
+            });
+        if !is_html {
             bail!("Got non-HTML text from {}", url);
         }
+        let html = resp.text().await?;
         Ok(html)
     }
 
@@ -292,7 +358,7 @@ impl Client {
         pr: Option<&dyn SingleReport>,
     ) -> Result<()> {
         let url = url.into_url()?;
-        let headers = github_headers(&url);
+        let headers = host_auth_headers(&url)?;
         self.download_file_with_headers(url, path, &headers, pr)
             .await
     }
@@ -304,31 +370,40 @@ impl Client {
         headers: &HeaderMap,
         pr: Option<&dyn SingleReport>,
     ) -> Result<()> {
+        ensure!(!Settings::get().offline(), "offline mode is enabled");
         let url = url.into_url()?;
         debug!("GET Downloading {} to {}", &url, display_path(path));
-        let mut resp = self.get_async_with_headers(url.clone(), headers).await?;
-        if let Some(length) = resp.content_length()
-            && let Some(pr) = pr
-        {
-            // Reset progress on each attempt
-            pr.set_length(length);
-            pr.set_position(0);
-        }
-
         let parent = path.parent().unwrap();
         file::create_dir_all(parent)?;
-        let mut file = tempfile::NamedTempFile::with_prefix_in(path, parent)?;
-        while let Some(chunk) = resp.chunk().await? {
-            if crate::ui::ctrlc::is_cancelled() {
-                bail!("download cancelled by user");
+
+        // Retry the whole download so a mid-stream chunk failure restarts from
+        // byte 0 instead of failing the install. send_once_with_https_fallback
+        // (not send_with_https_fallback) is used inside to avoid retry-on-retry.
+        retry_async("GET", &url, || async {
+            let mut resp = self
+                .send_once_with_https_fallback(Method::GET, url.clone(), headers, "GET")
+                .await?;
+            if let Some(length) = resp.content_length()
+                && let Some(pr) = pr
+            {
+                // Reset progress on each attempt
+                pr.set_length(length);
+                pr.set_position(0);
             }
-            file.write_all(&chunk)?;
-            if let Some(pr) = pr {
-                pr.inc(chunk.len() as u64);
+            let mut file = tempfile::NamedTempFile::with_prefix_in(path, parent)?;
+            while let Some(chunk) = resp.chunk().await? {
+                if crate::ui::ctrlc::is_cancelled() {
+                    bail!("download cancelled by user");
+                }
+                file.write_all(&chunk)?;
+                if let Some(pr) = pr {
+                    pr.inc(chunk.len() as u64);
+                }
             }
-        }
-        file.persist(path)?;
-        Ok(())
+            file.persist(path)?;
+            Ok(())
+        })
+        .await
     }
 
     async fn send_with_https_fallback(
@@ -338,47 +413,156 @@ impl Client {
         headers: &HeaderMap,
         verb_label: &str,
     ) -> Result<Response> {
-        Retry::spawn(
-            default_backoff_strategy(Settings::get().http_retries),
-            || {
-                let method = method.clone();
-                let url = url.clone();
-                let headers = headers.clone();
-                async move {
-                    match self
-                        .send_once(method.clone(), url.clone(), &headers, verb_label)
-                        .await
-                    {
-                        Ok(resp) => Ok(resp),
-                        Err(_err) if url.scheme() == "http" => {
-                            let mut url = url;
-                            url.set_scheme("https").unwrap();
-                            self.send_once(method, url, &headers, verb_label).await
-                        }
-                        Err(err) => Err(err),
-                    }
-                }
-            },
+        self.send_with_https_fallback_with_retries(
+            method,
+            url,
+            headers,
+            verb_label,
+            Settings::get().http_retries,
+            true,
         )
         .await
     }
 
-    async fn send_once(
+    async fn send_with_https_fallback_allow_error_status(
+        &self,
+        method: Method,
+        url: Url,
+        headers: &HeaderMap,
+        verb_label: &str,
+    ) -> Result<Response> {
+        self.send_with_https_fallback_with_retries(
+            method,
+            url,
+            headers,
+            verb_label,
+            Settings::get().http_retries,
+            false,
+        )
+        .await
+    }
+
+    async fn send_with_https_fallback_with_retries(
+        &self,
+        method: Method,
+        url: Url,
+        headers: &HeaderMap,
+        verb_label: &str,
+        retries: i64,
+        error_for_status: bool,
+    ) -> Result<Response> {
+        let retry_state = Arc::new(Mutex::new(RetryState {
+            headers: headers.clone(),
+            use_netrc: true,
+        }));
+        retry_async_with_retries(verb_label, &url, retries, || async {
+            let (headers, use_netrc) = {
+                let state = retry_state.lock().unwrap();
+                (state.headers.clone(), state.use_netrc)
+            };
+            let options = SendOnceOptions::new(Some(retry_state.clone()), use_netrc);
+            let options = if error_for_status {
+                options
+            } else {
+                options.allow_error_status()
+            };
+            self.send_once_with_https_fallback_with_retry_headers(
+                method.clone(),
+                url.clone(),
+                &headers,
+                verb_label,
+                options,
+            )
+            .await
+        })
+        .await
+    }
+
+    /// One attempt with http→https fallback, no retry. Used as the inner step
+    /// for both `send_with_https_fallback` (which adds retry) and
+    /// `download_file_with_headers` (which has its own outer retry covering the
+    /// chunk stream). Splitting this out avoids retry × retry blowup.
+    /// The fallback only fires on connection-level errors (corporate proxy
+    /// blocking plain http), not on HTTP status errors — falling back to https
+    /// after the server already returned a 4xx/5xx makes no sense.
+    async fn send_once_with_https_fallback(
+        &self,
+        method: Method,
+        url: Url,
+        headers: &HeaderMap,
+        verb_label: &str,
+    ) -> Result<Response> {
+        self.send_once_with_https_fallback_with_retry_headers(
+            method,
+            url,
+            headers,
+            verb_label,
+            SendOnceOptions::new(None, true),
+        )
+        .await
+    }
+
+    async fn send_once_with_https_fallback_with_retry_headers(
+        &self,
+        method: Method,
+        url: Url,
+        headers: &HeaderMap,
+        verb_label: &str,
+        options: SendOnceOptions,
+    ) -> Result<Response> {
+        match self
+            .send_once_with_retry_headers(
+                method.clone(),
+                url.clone(),
+                headers,
+                verb_label,
+                options.clone(),
+            )
+            .await
+        {
+            Ok(resp) => Ok(resp),
+            Err(err) if url.scheme() == "http" && is_connection_error(&err) => {
+                let mut url = url;
+                url.set_scheme("https").unwrap();
+                self.send_once_with_retry_headers(method, url, headers, verb_label, options)
+                    .await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn send_once_with_retry_headers(
+        &self,
+        method: Method,
+        url: Url,
+        headers: &HeaderMap,
+        verb_label: &str,
+        options: SendOnceOptions,
+    ) -> Result<Response> {
+        self.send_once_inner(method, url, headers, verb_label, options)
+            .await
+    }
+
+    async fn send_once_inner(
         &self,
         method: Method,
         mut url: Url,
         headers: &HeaderMap,
         verb_label: &str,
+        options: SendOnceOptions,
     ) -> Result<Response> {
+        let original_url = url.clone();
         apply_url_replacements(&mut url);
         debug!("{} {}", verb_label, &url);
 
         // Apply netrc credentials after URL replacement
         let mut final_headers = headers.clone();
-        final_headers.extend(netrc_headers(&url));
+        if options.use_netrc {
+            final_headers.extend(netrc_headers(&url));
+        }
 
-        let mut req = self.reqwest.request(method, url.clone());
-        req = req.headers(final_headers);
+        let mut req = self.reqwest.request(method.clone(), url.clone());
+        req = req.headers(final_headers.clone());
         let resp = match req.send().await {
             Ok(resp) => resp,
             Err(err) => {
@@ -389,24 +573,17 @@ impl Client {
                             "fetch_remote_versions_timeout",
                             "MISE_FETCH_REMOTE_VERSIONS_TIMEOUT",
                         ),
-                        ClientKind::VersionCheck => ("version_check_timeout", ""),
                     };
-                    let hint = if env_var.is_empty() {
-                        format!(
-                            "HTTP timed out after {} for {}.",
-                            format_duration(self.timeout),
-                            url
-                        )
-                    } else {
-                        format!(
-                            "HTTP timed out after {} for {} (change with `{}` or env `{}`).",
-                            format_duration(self.timeout),
-                            url,
-                            setting,
-                            env_var
-                        )
-                    };
-                    bail!(hint);
+                    let hint = format!(
+                        "HTTP timed out after {} for {} (change with `{}` or env `{}`).",
+                        format_duration(self.timeout),
+                        url,
+                        setting,
+                        env_var
+                    );
+                    // wrap_err preserves the underlying reqwest::Error in the chain so
+                    // is_transient() can still classify this as a retryable timeout.
+                    return Err(Report::new(err).wrap_err(hint));
                 }
                 return Err(err.into());
             }
@@ -416,8 +593,220 @@ impl Client {
         }
         debug!("{} {url} {}", verb_label, resp.status());
         display_github_rate_limit(&resp);
-        resp.error_for_status_ref()?;
+        if options.retry_github_oauth_401
+            && let Some(stale_access_token) =
+                stale_github_oauth_unauthorized_token(&original_url, &final_headers, &resp)
+            && let Some(host) = original_url.host_str()
+        {
+            match crate::github::oauth::refresh_cached_token_for_host(host, &stale_access_token)
+                .await
+            {
+                Ok(Some(token)) => {
+                    let mut headers = headers.clone();
+                    if let Ok(value) = HeaderValue::from_str(format!("Bearer {token}").as_str()) {
+                        headers.insert(AUTHORIZATION, value);
+                        if let Some(retry_state) = &options.retry_state {
+                            *retry_state.lock().unwrap() = RetryState {
+                                headers: headers.clone(),
+                                use_netrc: false,
+                            };
+                        }
+                        debug!(
+                            "{} {} retrying with refreshed GitHub OAuth token after 401",
+                            verb_label, &url
+                        );
+                        return Box::pin(self.send_once_inner(
+                            method,
+                            original_url,
+                            &headers,
+                            verb_label,
+                            options.recursive_retry(),
+                        ))
+                        .await;
+                    } else {
+                        debug!(
+                            "refreshed GitHub OAuth token contains invalid header bytes; skipping retry"
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    debug!("failed to refresh GitHub OAuth token after 401: {err:#}");
+                }
+            }
+        }
+        if options.error_for_status && is_github_forbidden(&url, &resp) {
+            let status = resp.status();
+            let status_error = resp
+                .error_for_status_ref()
+                .expect_err("403 response should be an error");
+            let used_github_token = final_headers.contains_key(AUTHORIZATION);
+            let rate_limit = github_rate_limit_summary(&resp);
+            let body = resp.text().await.unwrap_or_default();
+            // Retry without auth when the response mentions IP allow lists: GitHub App
+            // installation tokens (`ghs_*`) get 403 on public API resources for orgs with IP
+            // allow lists; stripping auth avoids that path.
+            // https://github.com/orgs/community/discussions/191185
+            // https://github.com/jdx/mise/discussions/9119
+            if used_github_token && body.contains("IP allow list") {
+                let mut headers = final_headers;
+                headers.remove(AUTHORIZATION);
+                debug!(
+                    "{} {} retrying without GitHub auth after {}",
+                    verb_label, &url, status
+                );
+                return Box::pin(self.send_once_inner(
+                    method,
+                    original_url,
+                    &headers,
+                    verb_label,
+                    options.recursive_retry(),
+                ))
+                .await;
+            }
+            return Err(github_forbidden_report(
+                status_error,
+                used_github_token,
+                rate_limit,
+                &body,
+            ));
+        }
+        if options.error_for_status {
+            resp.error_for_status_ref()?;
+        }
         Ok(resp)
+    }
+}
+
+pub struct TextRequest<'a> {
+    client: &'a Client,
+    url: Url,
+    extra_headers: HeaderMap,
+    retries: i64,
+}
+
+impl TextRequest<'_> {
+    pub fn headers(mut self, headers: &HeaderMap) -> Self {
+        self.extra_headers.extend(headers.clone());
+        self
+    }
+
+    pub fn retries(mut self, retries: i64) -> Self {
+        self.retries = retries;
+        self
+    }
+
+    pub async fn send(mut self) -> Result<String> {
+        ensure!(!Settings::get().offline(), "offline mode is enabled");
+        // Merge GitHub headers with any extra headers provided
+        let mut headers = host_auth_headers(&self.url)?;
+        headers.extend(self.extra_headers.clone());
+        let resp = self
+            .client
+            .send_with_https_fallback_with_retries(
+                Method::GET,
+                self.url.clone(),
+                &headers,
+                "GET",
+                self.retries,
+                true,
+            )
+            .await?;
+        let text = resp.text().await?;
+        if text.starts_with("<!DOCTYPE html>") {
+            if self.url.scheme() == "http" {
+                // try with https since http may be blocked
+                self.url.set_scheme("https").unwrap();
+                return Box::pin(self.send()).await;
+            }
+            bail!("Got HTML instead of text from {}", self.url);
+        }
+        Ok(text)
+    }
+}
+
+fn is_github_forbidden(url: &Url, resp: &Response) -> bool {
+    resp.status() == StatusCode::FORBIDDEN && url.host_str() == Some("api.github.com")
+}
+
+fn github_forbidden_report(
+    status_error: reqwest::Error,
+    used_github_token: bool,
+    rate_limit: Option<String>,
+    body: &str,
+) -> Report {
+    let token_status = if used_github_token { "yes" } else { "no" };
+    let rate_limit = rate_limit
+        .map(|summary| format!("\ngithub rate limit: {summary}"))
+        .unwrap_or_default();
+    let body = format_response_body(body);
+    eyre!("{status_error}\ngithub auth: {token_status}{rate_limit}\ngithub response: {body}")
+}
+
+fn format_response_body(body: &str) -> String {
+    const MAX_BODY_CHARS: usize = 4096;
+    if body.trim().is_empty() {
+        return "<empty>".to_string();
+    }
+
+    let mut chars = body.chars();
+    let mut formatted: String = chars.by_ref().take(MAX_BODY_CHARS).collect();
+    if chars.next().is_some() {
+        formatted.push_str("\n<truncated>");
+    }
+    formatted
+}
+
+fn github_rate_limit_summary(resp: &Response) -> Option<String> {
+    let headers = resp.headers();
+    let limit = headers
+        .get("x-ratelimit-limit")
+        .and_then(|h| h.to_str().ok());
+    let remaining = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|h| h.to_str().ok());
+    let resource = headers
+        .get("x-ratelimit-resource")
+        .and_then(|h| h.to_str().ok());
+    let reset = headers
+        .get("x-ratelimit-reset")
+        .and_then(|h| h.to_str().ok());
+
+    if limit.is_none() && remaining.is_none() && resource.is_none() && reset.is_none() {
+        return None;
+    }
+
+    Some(format!(
+        "{}/{}{}{}",
+        remaining.unwrap_or("?"),
+        limit.unwrap_or("?"),
+        resource
+            .map(|resource| format!(" ({resource})"))
+            .unwrap_or_default(),
+        reset
+            .map(|reset| format!(", resets at {reset}"))
+            .unwrap_or_default()
+    ))
+}
+
+fn stale_github_oauth_unauthorized_token(
+    url: &Url,
+    headers: &HeaderMap,
+    resp: &Response,
+) -> Option<String> {
+    if resp.status() != StatusCode::UNAUTHORIZED || !crate::github::is_github_api_url(url) {
+        return None;
+    }
+    let host = url.host_str()?;
+    let token = crate::github::oauth::cached_access_token_for_host(host)?;
+    let header_token = headers
+        .get(AUTHORIZATION)
+        .and_then(|header| header.to_str().ok())
+        .and_then(|header| header.strip_prefix("Bearer "))?;
+    if header_token == token {
+        Some(header_token.to_string())
+    } else {
+        None
     }
 }
 
@@ -433,18 +822,26 @@ pub fn error_code(e: &Report) -> Option<u16> {
     }
 }
 
-fn github_headers(url: &Url) -> HeaderMap {
-    let is_github = url.host_str().is_some_and(|h| {
-        h == "api.github.com"
-            || h == "github.com"
-            || h.ends_with(".githubusercontent.com")
-            || crate::github::is_gh_host(h)
-    });
-    if is_github {
-        crate::github::get_headers(url.as_str())
-    } else {
-        HeaderMap::new()
+fn host_auth_headers(url: &Url) -> Result<HeaderMap> {
+    if crate::github::is_github_api_url(url) {
+        return crate::github::get_headers(url.as_str());
     }
+
+    let Some(host) = url.host_str() else {
+        return Ok(HeaderMap::new());
+    };
+
+    let is_gitlab = host == "gitlab.com" || crate::gitlab::is_gitlab_host(host);
+    if is_gitlab {
+        return Ok(crate::gitlab::get_headers(url.as_str()));
+    }
+
+    let is_forgejo = host == "codeberg.org" || crate::forgejo::is_forgejo_host(host);
+    if is_forgejo {
+        return Ok(crate::forgejo::get_headers(url.as_str()));
+    }
+
+    Ok(HeaderMap::new())
 }
 
 /// Get HTTP Basic authentication headers from netrc file for the given URL
@@ -552,17 +949,114 @@ fn display_github_rate_limit(resp: &Response) {
     }
 }
 
-fn default_backoff_strategy(retries: i64) -> impl Iterator<Item = std::time::Duration> {
-    ExponentialBackoff::from_millis(10)
-        .map(jitter)
+fn default_backoff_strategy(retries: i64) -> impl Iterator<Item = Duration> {
+    // Hand-rolled schedule (with jitter): ~200ms / ~1s / ~4s / ~15s, then 15s
+    // for every retry beyond the schedule. The trailing repeat matters because
+    // `MISE_HTTP_RETRIES` can be set arbitrarily high — a fixed-length array
+    // would silently cap retries at its length. tokio_retry's ExponentialBackoff
+    // ::from_millis is geometric in the base (base, base*base, …) so picking a
+    // base that gives nice human-scale delays is awkward; explicit is clearer.
+    [200u64, 1_000, 4_000, 15_000]
+        .into_iter()
+        .chain(std::iter::repeat(15_000))
+        .map(Duration::from_millis)
+        .map(equal_jitter)
         .take(retries.max(0) as usize)
+}
+
+/// Jitter the duration to a random value in `[d/2, d)` — "equal jitter" per
+/// AWS's backoff guidance. Avoids tokio_retry's `jitter` which can return
+/// near-zero (its range is `[0, d)`), defeating the point of backoff.
+fn equal_jitter(d: Duration) -> Duration {
+    let factor = 0.5 + rand::random::<f64>() * 0.5;
+    Duration::from_secs_f64(d.as_secs_f64() * factor)
+}
+
+/// True if the error is a network-layer connection problem (no status received).
+/// Used to decide when http→https fallback makes sense: only when the http
+/// attempt never reached the server, not when the server returned a status.
+fn is_connection_error(err: &Report) -> bool {
+    err.chain().any(|e| {
+        let Some(reqwest_err) = e.downcast_ref::<reqwest::Error>() else {
+            return false;
+        };
+        (reqwest_err.is_connect() || reqwest_err.is_timeout()) && reqwest_err.status().is_none()
+    })
+}
+
+/// Classifies an error as transient (should retry) vs permanent.
+/// Walks the error chain so wrapped errors (e.g. our timeout hint) still match.
+pub(crate) fn is_transient(err: &Report) -> bool {
+    err.chain().any(|e| {
+        let Some(reqwest_err) = e.downcast_ref::<reqwest::Error>() else {
+            return false;
+        };
+        // Network-layer failures: connect refused, timeout, mid-stream body drop.
+        if reqwest_err.is_timeout() || reqwest_err.is_connect() || reqwest_err.is_body() {
+            return true;
+        }
+        // Status errors: 5xx server errors plus 408 (Request Timeout) and
+        // 429 (Too Many Requests). Other 4xx are deterministic — don't retry.
+        if let Some(status) = reqwest_err.status() {
+            let code = status.as_u16();
+            return code == 408 || code == 429 || (500..600).contains(&code);
+        }
+        false
+    })
+}
+
+/// Retry an async operation on transient errors using `default_backoff_strategy`.
+/// Emits a warn! immediately on each transient failure so the user sees flaky
+/// infrastructure as it's happening, instead of waiting through the backoff
+/// schedule. Successful rescues and final exhaustion don't get extra warnings
+/// — the caller surfaces the outcome.
+pub(crate) async fn retry_async<F, Fut, T>(verb_label: &str, url: &Url, f: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    retry_async_with_retries(verb_label, url, Settings::get().http_retries, f).await
+}
+
+pub(crate) async fn retry_async_with_retries<F, Fut, T>(
+    verb_label: &str,
+    url: &Url,
+    retries: i64,
+    mut f: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut backoff = default_backoff_strategy(retries);
+    let mut attempt: usize = 1;
+    loop {
+        match f().await {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                if !is_transient(&err) {
+                    return Err(err);
+                }
+                let Some(delay) = backoff.next() else {
+                    return Err(err);
+                };
+                warn!(
+                    "HTTP {} {} attempt {} failed (transient): {}; retrying in {:?}",
+                    verb_label, url, attempt, err, delay
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use confique::Partial;
+    use confique::Layer;
     use indexmap::IndexMap;
+    use std::path::PathBuf;
     use url::Url;
 
     // Mutex to ensure tests don't interfere with each other when modifying global settings
@@ -590,6 +1084,425 @@ mod tests {
         crate::config::Settings::reset(None);
 
         result
+    }
+
+    #[tokio::test]
+    async fn test_get_html_accepts_text_html_without_doctype() {
+        let mut server = mockito::Server::new_async().await;
+        let expected_body = "<html><body>package index</body></html>";
+        let mock = server
+            .mock("GET", "/simple")
+            .with_status(200)
+            .with_header("content-type", "text/html")
+            .with_body(expected_body)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = Client::new(Duration::from_secs(3), ClientKind::Http).unwrap();
+        let html = client
+            .get_html(format!("{}/simple", server.url()))
+            .await
+            .unwrap();
+
+        assert_eq!(html, expected_body);
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_get_html_rejects_non_html_content_type() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/plain")
+            .with_status(200)
+            .with_header("content-type", "text/plain")
+            .with_body("<!DOCTYPE html><html></html>")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = Client::new(Duration::from_secs(3), ClientKind::Http).unwrap();
+        let err = client
+            .get_html(format!("{}/plain", server.url()))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Got non-HTML text from"));
+        mock.assert();
+    }
+
+    // RAII guard that holds the global test lock and resets settings on drop.
+    // Use this in async tests so the mutex stays held across .await points
+    // without sync/async closure shenanigans.
+    struct SettingsGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl Drop for SettingsGuard {
+        fn drop(&mut self) {
+            crate::config::Settings::reset(None);
+        }
+    }
+    fn set_test_http_retries(retries: i64) -> SettingsGuard {
+        let lock = TEST_SETTINGS_LOCK.lock().unwrap();
+        let mut settings = crate::config::settings::SettingsPartial::empty();
+        settings.http_retries = Some(retries);
+        crate::config::Settings::reset(Some(settings));
+        SettingsGuard { _lock: lock }
+    }
+    fn set_test_offline() -> SettingsGuard {
+        let lock = TEST_SETTINGS_LOCK.lock().unwrap();
+        let mut settings = crate::config::settings::SettingsPartial::empty();
+        settings.offline = Some(true);
+        crate::config::Settings::reset(Some(settings));
+        SettingsGuard { _lock: lock }
+    }
+
+    struct GithubOauthSettingsGuard {
+        _settings_lock: std::sync::MutexGuard<'static, ()>,
+        _github_env_lock: std::sync::MutexGuard<'static, ()>,
+        vars: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl Drop for GithubOauthSettingsGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.vars {
+                if let Some(value) = value {
+                    crate::env::set_var(key, value);
+                } else {
+                    crate::env::remove_var(key);
+                }
+            }
+            crate::github::oauth::test_support::clear_cache_path();
+            crate::config::Settings::reset(None);
+        }
+    }
+
+    fn set_test_github_oauth(server_url: &str, cache_path: PathBuf) -> GithubOauthSettingsGuard {
+        let settings_lock = TEST_SETTINGS_LOCK.lock().unwrap();
+        let github_env_lock = crate::github::TEST_ENV_LOCK.lock().unwrap();
+        let vars = vec![
+            ("MISE_EXPERIMENTAL", std::env::var("MISE_EXPERIMENTAL").ok()),
+            (
+                "MISE_GITHUB_OAUTH_CLIENT_ID",
+                std::env::var("MISE_GITHUB_OAUTH_CLIENT_ID").ok(),
+            ),
+            (
+                "MISE_GITHUB_OAUTH_AUTH_URL",
+                std::env::var("MISE_GITHUB_OAUTH_AUTH_URL").ok(),
+            ),
+            (
+                "MISE_GITHUB_OAUTH_API_URL",
+                std::env::var("MISE_GITHUB_OAUTH_API_URL").ok(),
+            ),
+            (
+                "MISE_GITHUB_OAUTH_SCOPES",
+                std::env::var("MISE_GITHUB_OAUTH_SCOPES").ok(),
+            ),
+            ("MISE_GITHUB_TOKEN", std::env::var("MISE_GITHUB_TOKEN").ok()),
+            ("GITHUB_API_TOKEN", std::env::var("GITHUB_API_TOKEN").ok()),
+            ("GITHUB_TOKEN", std::env::var("GITHUB_TOKEN").ok()),
+        ];
+
+        crate::env::set_var("MISE_EXPERIMENTAL", "1");
+        crate::env::set_var("MISE_GITHUB_OAUTH_CLIENT_ID", "Iv1.mock");
+        crate::env::set_var("MISE_GITHUB_OAUTH_AUTH_URL", format!("{server_url}/login"));
+        crate::env::set_var("MISE_GITHUB_OAUTH_API_URL", format!("{server_url}/api/v3"));
+        crate::env::remove_var("MISE_GITHUB_OAUTH_SCOPES");
+        crate::env::remove_var("MISE_GITHUB_TOKEN");
+        crate::env::remove_var("GITHUB_API_TOKEN");
+        crate::env::remove_var("GITHUB_TOKEN");
+        crate::github::oauth::test_support::set_cache_path(cache_path);
+        crate::config::Settings::reset(None);
+
+        GithubOauthSettingsGuard {
+            _settings_lock: settings_lock,
+            _github_env_lock: github_env_lock,
+            vars,
+        }
+    }
+
+    // A tiny in-process HTTP/1.1 responder. Each accepted connection consumes
+    // the next response from `responses` and writes it back. Returns the bound
+    // port and an Arc counter of connections actually served.
+    async fn spawn_canned_server(
+        responses: Vec<&'static str>,
+    ) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let (port, count, _) = spawn_recording_server(responses).await;
+        (port, count)
+    }
+
+    async fn spawn_recording_server(
+        responses: Vec<&'static str>,
+    ) -> (
+        u16,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let count = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let count_inner = count.clone();
+        let requests_inner = requests.clone();
+        tokio::spawn(async move {
+            for resp in responses {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                count_inner.fetch_add(1, Ordering::SeqCst);
+                // Drain request headers (read until \r\n\r\n or EOF).
+                let mut buf = [0u8; 4096];
+                let mut total = Vec::new();
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            total.extend_from_slice(&buf[..n]);
+                            if total.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                requests_inner
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&total).to_string());
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (port, count, requests)
+    }
+
+    fn ok_response() -> &'static str {
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
+    }
+    fn bad_gateway_response() -> &'static str {
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    }
+    fn not_found_response() -> &'static str {
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    }
+    fn server_error_response() -> &'static str {
+        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    }
+    fn unauthorized_response() -> &'static str {
+        "HTTP/1.1 401 Unauthorized\r\nContent-Length: 15\r\nConnection: close\r\n\r\nBad credentials"
+    }
+    fn github_forbidden_response() -> &'static str {
+        concat!(
+            "HTTP/1.1 403 Forbidden\r\n",
+            "Content-Type: application/json\r\n",
+            "X-RateLimit-Limit: 5000\r\n",
+            "X-RateLimit-Remaining: 42\r\n",
+            "X-RateLimit-Resource: core\r\n",
+            "X-RateLimit-Reset: 1781337353\r\n",
+            "Content-Length: 47\r\n",
+            "Connection: close\r\n",
+            "\r\n",
+            r#"{"message":"secondary rate limit","docs":"url"}"#
+        )
+    }
+    fn github_oauth_token_response() -> &'static str {
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 51\r\nConnection: close\r\n\r\n{\"access_token\":\"ghu-refreshed\",\"expires_in\":28800}"
+    }
+    fn json_empty_array_response() -> &'static str {
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]"
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_github_oauth_401_refreshes_and_retries_once() {
+        let (port, count, requests) = spawn_recording_server(vec![
+            unauthorized_response(),
+            github_oauth_token_response(),
+            json_empty_array_response(),
+        ])
+        .await;
+        let server_url = format!("http://127.0.0.1:{port}");
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("github-oauth-tokens.toml");
+        let _guard = set_test_github_oauth(&server_url, cache_path.clone());
+        let settings = crate::config::Settings::get();
+        let cache_key = crate::github::oauth::test_support::cache_key(
+            "127.0.0.1",
+            "Iv1.mock",
+            settings.github.oauth_scopes.trim(),
+        );
+        std::fs::write(
+            &cache_path,
+            format!(
+                r#"[tokens.{cache_key}]
+access_token = "ghu-stale"
+expires_at = "2099-01-01T00:00:00Z"
+refresh_token = "ghr-refresh"
+refresh_expires_at = "2099-01-01T00:00:00Z"
+"#
+            ),
+        )
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer ghu-stale"));
+        let client = Client::new(Duration::from_secs(3), ClientKind::Http).unwrap();
+        let text = client
+            .get_text_request(format!("{server_url}/api/v3/repos/owner/repo/releases"))
+            .headers(&headers)
+            .send()
+            .await
+            .unwrap_or_else(|err| {
+                let requests = requests.lock().unwrap();
+                panic!(
+                    "request failed: {err:#}\nrequests:\n{}",
+                    requests.join("\n---\n")
+                );
+            });
+
+        assert_eq!(text, "[]");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let requests = requests.lock().unwrap();
+        let first_request = requests[0].to_ascii_lowercase();
+        let refresh_request = requests[1].to_ascii_lowercase();
+        let retry_request = requests[2].to_ascii_lowercase();
+        assert!(first_request.contains("get /api/v3/repos/owner/repo/releases"));
+        assert!(first_request.contains("authorization: bearer ghu-stale"));
+        assert!(refresh_request.contains("post /login/oauth/access_token"));
+        assert!(retry_request.contains("get /api/v3/repos/owner/repo/releases"));
+        assert!(retry_request.contains("authorization: bearer ghu-refreshed"));
+        let cache = std::fs::read_to_string(cache_path).unwrap();
+        assert!(cache.contains("ghu-refreshed"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_github_forbidden_report_includes_body_and_auth_state() {
+        let (port, _count) = spawn_canned_server(vec![github_forbidden_response()]).await;
+        let url = format!("http://127.0.0.1:{port}/repos/microsoft/edit/releases");
+        let resp = reqwest::Client::new().get(url).send().await.unwrap();
+        let rate_limit = github_rate_limit_summary(&resp);
+        let status_error = resp
+            .error_for_status_ref()
+            .expect_err("403 response should be an error");
+        let body = resp.text().await.unwrap();
+        let err = github_forbidden_report(status_error, true, rate_limit, &body);
+        let msg = format!("{err:?}");
+
+        assert!(msg.contains("github auth: yes"));
+        assert!(msg.contains("github rate limit: 42/5000 (core), resets at 1781337353"));
+        assert!(msg.contains(r#"{"message":"secondary rate limit","docs":"url"}"#));
+    }
+
+    #[test]
+    fn test_format_response_body_handles_empty_and_truncates() {
+        assert_eq!(format_response_body(" \n\t"), "<empty>");
+
+        let body = "a".repeat(4097);
+        let formatted = format_response_body(&body);
+        assert_eq!(formatted.strip_suffix("\n<truncated>").unwrap().len(), 4096);
+        assert!(formatted.ends_with("\n<truncated>"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_retry_succeeds_after_two_502s() {
+        // 2 retries is enough to verify the rescue path (2 failures + 1 success)
+        // without paying the third backoff (~12.5s).
+        let _guard = set_test_http_retries(2);
+        let (port, count) = spawn_canned_server(vec![
+            bad_gateway_response(),
+            bad_gateway_response(),
+            ok_response(),
+        ])
+        .await;
+        let url: Url = format!("http://127.0.0.1:{}/", port).parse().unwrap();
+        let client = Client::new(Duration::from_secs(2), ClientKind::Http).unwrap();
+        let resp = client.get_async(url).await.unwrap();
+        assert!(resp.status().is_success());
+        // Should have served 3 connections: two 502s + one 200.
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_no_retry_on_404() {
+        let _guard = set_test_http_retries(3);
+        let (port, count) = spawn_canned_server(vec![not_found_response()]).await;
+        let url: Url = format!("http://127.0.0.1:{}/", port).parse().unwrap();
+        let client = Client::new(Duration::from_secs(2), ClientKind::Http).unwrap();
+        let err = client.get_async(url).await.unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("404"), "expected 404 in error: {msg}");
+        // Should not have retried — only one connection.
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_retry_exhausted_on_persistent_500() {
+        // Use 1 retry so the test doesn't pay the full backoff schedule;
+        // the behavior under test (exhaustion → final error) is the same.
+        let _guard = set_test_http_retries(1);
+        // 2 connections: initial + 1 retry.
+        let (port, count) =
+            spawn_canned_server(vec![server_error_response(), server_error_response()]).await;
+        let url: Url = format!("http://127.0.0.1:{}/", port).parse().unwrap();
+        let client = Client::new(Duration::from_secs(2), ClientKind::Http).unwrap();
+        let err = client.get_async(url).await.unwrap_err();
+        assert!(format!("{err:?}").contains("500"));
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_text_request_can_override_retry_count() {
+        let _guard = set_test_http_retries(3);
+        let (port, count) = spawn_canned_server(vec![
+            bad_gateway_response(),
+            bad_gateway_response(),
+            ok_response(),
+        ])
+        .await;
+        let url: Url = format!("http://127.0.0.1:{}/", port).parse().unwrap();
+        let client = Client::new(Duration::from_secs(2), ClientKind::Http).unwrap();
+        let err = client
+            .get_text_request(url)
+            .retries(1)
+            .send()
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("502"));
+        // Should stop after the initial request plus the single overridden retry.
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_text_request_respects_offline_mode() {
+        let _guard = set_test_offline();
+        let (port, count) = spawn_canned_server(vec![ok_response()]).await;
+        let url: Url = format!("http://127.0.0.1:{}/", port).parse().unwrap();
+        let client = Client::new(Duration::from_secs(2), ClientKind::Http).unwrap();
+        let err = client.get_text_request(url).send().await.unwrap_err();
+        assert_eq!(err.to_string(), "offline mode is enabled");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_backoff_strategy_yields_requested_count_beyond_schedule() {
+        // Regression: a fixed-length schedule used to silently cap retries at 4.
+        // Now extra retries should fall back to the longest delay.
+        let delays: Vec<_> = default_backoff_strategy(7).collect();
+        assert_eq!(delays.len(), 7);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_retries_disabled_fails_immediately() {
+        let _guard = set_test_http_retries(0);
+        let (port, count) = spawn_canned_server(vec![bad_gateway_response()]).await;
+        let url: Url = format!("http://127.0.0.1:{}/", port).parse().unwrap();
+        let client = Client::new(Duration::from_secs(2), ClientKind::Http).unwrap();
+        let err = client.get_async(url).await.unwrap_err();
+        assert!(format!("{err:?}").contains("502"));
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

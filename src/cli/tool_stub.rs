@@ -7,7 +7,9 @@ use crate::dirs;
 use crate::file;
 use crate::hash;
 use crate::lockfile::PlatformInfo;
-use crate::toolset::{InstallOptions, ToolRequest, ToolSource, ToolVersionOptions};
+use crate::toolset::{
+    CoreToolOptions, InstallOptions, ToolRequest, ToolSource, ToolVersionOptions,
+};
 use clap::Parser;
 use color_eyre::eyre::{Result, bail, eyre};
 use eyre::ensure;
@@ -198,9 +200,12 @@ impl ToolStubFile {
         }
 
         let options = ToolVersionOptions {
-            os: self.os.clone(),
-            install_env: self.install_env.clone(),
-            opts,
+            core: CoreToolOptions {
+                os: self.os.clone(),
+                depends: None,
+                install_env: self.install_env.clone(),
+            },
+            opts: opts.into(),
         };
 
         // Set options on the BackendArg so they're available to the backend
@@ -580,7 +585,7 @@ async fn execute_with_tool_request(
             }
             env.insert(crate::env::PATH_KEY.to_string(), path_env.to_string());
 
-            crate::cli::exec::exec_program(bin_path, args, env, &Default::default()).await
+            crate::cli::exec::exec_program(bin_path, args, env, &Default::default(), false).await
         }
         Err(e) => match e {
             BinPathError::ToolNotFound(tool_name) => {
@@ -633,7 +638,7 @@ async fn execute_with_tool_request(
 /// The stub will automatically install the specified tool version if missing
 /// and execute it with any arguments passed to the stub.
 ///
-/// For more information, see: https://mise.jdx.dev/dev-tools/tool-stubs.html
+/// For more information, see: https://mise.en.dev/dev-tools/tool-stubs.html
 #[derive(Debug, Parser)]
 #[clap(disable_help_flag = true, disable_version_flag = true)]
 pub struct ToolStub {
@@ -702,6 +707,7 @@ pub(crate) async fn short_circuit_stub(args: &[String]) -> Result<()> {
             args,
             BTreeMap::new(),
             &Default::default(),
+            false,
         )
         .await;
     }

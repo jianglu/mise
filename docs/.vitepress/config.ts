@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitepress";
 import { Command, commands } from "./cli_commands";
 import {
@@ -8,6 +11,16 @@ import { tabsMarkdownPlugin } from "vitepress-plugin-tabs";
 import { withMermaid } from "vitepress-plugin-mermaid";
 import kdlGrammar from "./grammars/kdl.tmLanguage.json";
 import miseTomlGrammar from "./grammars/mise-toml.tmLanguage.json";
+
+const configDir = dirname(fileURLToPath(import.meta.url));
+const cargoToml = readFileSync(resolve(configDir, "../../Cargo.toml"), "utf8");
+const versionMatch = cargoToml.match(
+  /^\[package\][\s\S]*?^\s*version\s*=\s*"([^"]+)"/m,
+);
+if (!versionMatch) {
+  console.warn("Unable to find package version in Cargo.toml");
+}
+const latestVersion = versionMatch?.[1] ?? "0.0.0";
 
 // https://vitepress.dev/reference/site-config
 export default withMermaid(
@@ -30,6 +43,10 @@ export default withMermaid(
         { text: "Dev Tools", link: "/dev-tools/" },
         { text: "Environments", link: "/environments/" },
         { text: "Tasks", link: "/tasks/" },
+        {
+          text: `v${latestVersion}`,
+          link: "https://github.com/jdx/mise/releases",
+        },
       ],
       sidebar: [
         {
@@ -68,7 +85,9 @@ export default withMermaid(
             { text: "Registry", link: "/registry" },
             { text: "GitHub Tokens", link: "/dev-tools/github-tokens" },
             { text: "mise.lock Lockfile", link: "/dev-tools/mise-lock" },
-            { text: "Prepare", link: "/dev-tools/prepare" },
+            { text: "Security", link: "/security" },
+            { text: "OCI Images (experimental)", link: "/dev-tools/mise-oci" },
+            { text: "Deps", link: "/dev-tools/deps" },
             {
               text: "Backend Architecture",
               link: "/dev-tools/backend_architecture",
@@ -110,10 +129,53 @@ export default withMermaid(
                 { text: "http", link: "/dev-tools/backends/http" },
                 { text: "npm", link: "/dev-tools/backends/npm" },
                 { text: "pipx", link: "/dev-tools/backends/pipx" },
+                { text: "pkgx", link: "/dev-tools/backends/pkgx" },
                 { text: "spm", link: "/dev-tools/backends/spm" },
                 { text: "ubi", link: "/dev-tools/backends/ubi" },
                 { text: "vfox", link: "/dev-tools/backends/vfox" },
               ],
+            },
+          ],
+        },
+        {
+          text: "Bootstrap (experimental)",
+          items: [
+            { text: "Overview", link: "/bootstrap" },
+            {
+              text: "Bootstrap Packages",
+              link: "/bootstrap/packages/",
+              collapsed: true,
+              items: [
+                { text: "apk", link: "/bootstrap/packages/apk" },
+                { text: "apt", link: "/bootstrap/packages/apt" },
+                { text: "dnf", link: "/bootstrap/packages/dnf" },
+                { text: "pacman", link: "/bootstrap/packages/pacman" },
+                { text: "brew", link: "/bootstrap/packages/brew" },
+              ],
+            },
+            {
+              text: "Repos",
+              link: "/bootstrap/repos",
+            },
+            {
+              text: "Dotfiles",
+              link: "/dotfiles",
+            },
+            {
+              text: "Shell Activation",
+              link: "/bootstrap/shell",
+            },
+            {
+              text: "macOS Defaults",
+              link: "/bootstrap/macos-defaults",
+            },
+            {
+              text: "launchd",
+              link: "/bootstrap/launchd",
+            },
+            {
+              text: "User Login Shell",
+              link: "/bootstrap/user",
             },
           ],
         },
@@ -176,6 +238,7 @@ export default withMermaid(
           text: "About",
           items: [
             { text: "About mise", link: "/about" },
+            { text: "mise-en-place: The Song", link: "/mise-en-place" },
             { text: "Glossary", link: "/glossary" },
             { text: "FAQs", link: "/faq" },
             { text: "Troubleshooting", link: "/troubleshooting" },
@@ -208,7 +271,6 @@ export default withMermaid(
             { text: "Templates", link: "/templates" },
             { text: "URL Replacements", link: "/url-replacements" },
             { text: "Model Context Protocol", link: "/mcp" },
-            { text: "How I Use mise", link: "/how-i-use-mise" },
             { text: "Directory Structure", link: "/directories" },
             { text: "Cache Behavior", link: "/cache-behavior" },
           ],
@@ -240,11 +302,7 @@ export default withMermaid(
           insights: true,
         },
       },
-      footer: {
-        message:
-          'Licensed under the MIT License. Maintained by <a href="https://github.com/jdx">@jdx</a> and <a href="https://github.com/jdx/mise/graphs/contributors">friends</a>.',
-        copyright: `Copyright © ${new Date().getFullYear()} <a href="https://github.com/jdx">@jdx</a>`,
-      },
+      footer: false,
       carbonAds: {
         code: "CWYIPKQN",
         placement: "misejdxdev",
@@ -277,6 +335,9 @@ export default withMermaid(
       },
     },
     vite: {
+      build: {
+        target: "es2022",
+      },
       plugins: [
         groupIconVitePlugin({
           customIcon: {
@@ -342,7 +403,6 @@ export default withMermaid(
           rel: "stylesheet",
         },
       ],
-      // Analytics
       [
         "script",
         {
@@ -358,15 +418,7 @@ export default withMermaid(
       gtag('js', new Date());
       gtag('config', 'G-B69G389C8T');`,
       ],
-      [
-        "script",
-        {
-          "data-goatcounter": "https://jdx.goatcounter.com/count",
-          async: "",
-          src: "//gc.zgo.at/count.js",
-        },
-      ],
-      // OpenGraph
+      // Open Graph
       ["meta", { property: "og:site_name", content: "mise-en-place" }],
       ["meta", { property: "og:type", content: "website" }],
       [
@@ -404,6 +456,12 @@ export default withMermaid(
           title: "Sitemap",
         },
       ]);
+    },
+    transformHtml(code) {
+      return code.replace(
+        /<script id="check-dark-mode">/,
+        '<script id="check-dark-mode" data-cfasync="false">',
+      );
     },
   }),
 );

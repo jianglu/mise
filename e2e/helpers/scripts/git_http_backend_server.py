@@ -119,6 +119,27 @@ def create_test_repo(repo_path):
     ripgrep_file.write_text('#!/usr/bin/env bash\necho "ripgrep task executed"\n')
     ripgrep_file.chmod(0o755)
 
+    # A toml task file colocated with the executable scripts. Keys are task
+    # names; values are the run command (or a table). Used by tests covering
+    # remote toml task includes.
+    tasks_toml = xtasks_dir / 'tasks.toml'
+    tasks_toml.write_text(
+        'toml_task = "echo toml_task executed"\n'
+        '\n'
+        '[toml_table_task]\n'
+        'run = "echo toml_table_task executed"\n'
+        'description = "TOML task with table form"\n'
+    )
+
+    # A standalone toml file in a sibling directory to test the
+    # `git::URL//path/to/file.toml` form.
+    standalone_dir = Path(repo_path) / 'xtasks' / 'standalone'
+    standalone_dir.mkdir(parents=True)
+    standalone_toml = standalone_dir / 'standalone.toml'
+    standalone_toml.write_text(
+        'standalone_task = "echo standalone_task executed"\n'
+    )
+
     # Commit files
     subprocess.run(['git', 'add', '.'], cwd=repo_path, check=True)
     subprocess.run(['git', 'commit', '-m', 'Add test files'], cwd=repo_path, check=True)
@@ -159,16 +180,21 @@ def start_server(port=0):
         print(f"Git HTTP server running on port {actual_port}")
         print(f"Repository URL: http://localhost:{actual_port}/repo.git")
 
-        # Write the actual port to a file for the test to read
-        port_file = Path('/tmp/mise_git_http_port')
+        # Write server state to files for the test to read. Allow the e2e
+        # harness to place these under the per-test TMPDIR for parallel runs.
+        port_file = Path(os.environ.get('MISE_GIT_HTTP_PORT_FILE', '/tmp/mise_git_http_port'))
+        ready_file = Path(os.environ.get('MISE_GIT_HTTP_READY_FILE', '/tmp/mise_git_http_ready'))
+        info_file = Path(os.environ.get('MISE_GIT_HTTP_INFO_FILE', '/tmp/mise_git_http_info'))
+        port_file.parent.mkdir(parents=True, exist_ok=True)
+        ready_file.parent.mkdir(parents=True, exist_ok=True)
+        info_file.parent.mkdir(parents=True, exist_ok=True)
         port_file.write_text(str(actual_port))
 
         # Also write a ready marker file
-        ready_file = Path('/tmp/mise_git_http_ready')
         ready_file.write_text('ready')
 
         # Save cleanup info
-        with open('/tmp/mise_git_http_info', 'w') as f:
+        with open(info_file, 'w') as f:
             f.write(f"{temp_dir}\n")
 
         try:
@@ -178,6 +204,7 @@ def start_server(port=0):
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
             port_file.unlink(missing_ok=True)
+            info_file.unlink(missing_ok=True)
             ready_file.unlink(missing_ok=True)
 
 if __name__ == '__main__':
